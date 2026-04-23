@@ -21,19 +21,19 @@ jobs:
       - name: List contents (sanity check)
         run: ls -lh ./artifact
 
-      - name: Create release and upload asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
-          files: ./artifact/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #- name: Create Release
+      #- name: Create release and upload asset
       #  uses: softprops/action-gh-release@v2
       #  with:
-      #    name: ${{ env.ARTIFACT_NAME }}
-      #    files: 2025-10-01-raspios-trixie-arm64-lite.img.xz
-      #    tag_name: "tetra3rs_mp_v1.0.0"
+      #    tag_name: build-${{ github.run_number }}
+      #    name: Build ${{ github.run_number }}
+      #    files: ./artifact/*
       #  env:
       #    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          files: 2025-10-01-raspios-trixie-arm64-lite.img.xz
+          tag_name: "tetra3rs_mp_v1.0.0"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
