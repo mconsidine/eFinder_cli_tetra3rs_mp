@@ -475,7 +475,7 @@ jobs:
                mv /var/www/html/index.html /var/www/html/apacheindex.html || true"
 
           EFINDER_CONF=/mnt/pi/etc/apache2/conf-available/efinder.conf
-          echo "Timeout 3600" | sudo tee "$EFENDER_CONF" > /dev/null
+          echo "Timeout 3600" | sudo tee "$EFINDER_CONF" > /dev/null
           sudo chroot /mnt/pi a2enconf efinder
           sudo chroot /mnt/pi chmod -R 755 /var/www/html
           sudo chroot /mnt/pi chown -R www-data:www-data /var/www/html
