@@ -2,7 +2,7 @@ name: tetra3rs_mp Build eFinder RPi Image
 
 on:
   push:
-    branches: [ main ]
+    branches: [ dev ]
 
   workflow_dispatch:
     inputs:
@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: dev
 
       - name: Free up runner disk space
         run: |
