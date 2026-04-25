@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ github.ref_name }}
 
       - name: Free up runner disk space
         run: |
@@ -463,7 +463,7 @@ jobs:
         run: |
           sudo chroot /mnt/pi sudo -u efinder git clone --depth 1 \
               --branch tetra3rs_mp \
-              https://github.com/mconsidine/eFinder_cli.git \
+              https://github.com/mconsidine/eFinder_cli_tetra3rs_mp.git \
               /home/efinder/eFinder_cli
 
           # Copy Solver files from clone (supplements files already staged from repo)
