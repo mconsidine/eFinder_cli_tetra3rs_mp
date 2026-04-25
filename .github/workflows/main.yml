@@ -268,11 +268,28 @@ jobs:
           # ------------------------------------------------------------------
           sudo mkdir -p $ROOT/usr/local/bin
           FBSCRIPT=$ROOT/usr/local/bin/efinder-firstboot.sh
+          
+          #echo "#!/bin/bash"                                                                | sudo tee    "$FBSCRIPT" > /dev/null
+          #echo "set -e"                                                                     | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "# Unblock WiFi and set regulatory domain before NM starts AP"              | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "rfkill unblock wifi 2>/dev/null || true"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "iw reg set US 2>/dev/null || true"                                         | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "NM=/etc/NetworkManager/system-connections/efinder-ap.nmconnection"         | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "MAC=\$(cat /sys/class/net/wlan0/address 2>/dev/null || echo '')"           | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "if [ -n \"\$MAC\" ]; then"                                                 | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "    LAST4=\$(echo \"\$MAC\" | tr -d ':' | tail -c 5)"                      | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "    NEW_SSID=\"efinder\${LAST4}\""                                         | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "    sed -i \"s/^ssid=.*/ssid=\${NEW_SSID}/\" \"\$NM\""                    | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "    nmcli connection reload 2>/dev/null || true"                           | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "    nmcli connection up efinder-ap 2>/dev/null || true"                    | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "    echo \"efinder-firstboot: SSID set to \${NEW_SSID}\""                  | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "fi"                                                                         | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "systemctl disable efinder-firstboot.service"                               | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "rm -f /etc/systemd/system/efinder-firstboot.service"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "rm -f /usr/local/bin/efinder-firstboot.sh"                                 | sudo tee -a "$FBSCRIPT" > /dev/null
+          #echo "systemctl daemon-reload"                                                    | sudo tee -a "$FBSCRIPT" > /dev/null
+          
           echo "#!/bin/bash"                                                                | sudo tee    "$FBSCRIPT" > /dev/null
-          echo "set -e"                                                                     | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "# Unblock WiFi and set regulatory domain before NM starts AP"              | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "rfkill unblock wifi 2>/dev/null || true"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "iw reg set US 2>/dev/null || true"                                         | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "NM=/etc/NetworkManager/system-connections/efinder-ap.nmconnection"         | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "MAC=\$(cat /sys/class/net/wlan0/address 2>/dev/null || echo '')"           | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "if [ -n \"\$MAC\" ]; then"                                                 | sudo tee -a "$FBSCRIPT" > /dev/null
@@ -287,13 +304,15 @@ jobs:
           echo "rm -f /etc/systemd/system/efinder-firstboot.service"                       | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "rm -f /usr/local/bin/efinder-firstboot.sh"                                 | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "systemctl daemon-reload"                                                    | sudo tee -a "$FBSCRIPT" > /dev/null
+          
           sudo chmod 755 "$FBSCRIPT"
 
           FBSVC=$ROOT/etc/systemd/system/efinder-firstboot.service
           echo "[Unit]"                                                                     | sudo tee    "$FBSVC" > /dev/null
           echo "Description=eFinder first-boot SSID configuration"                         | sudo tee -a "$FBSVC" > /dev/null
-          echo "Before=NetworkManager.service"                                             | sudo tee -a "$FBSVC" > /dev/null
-          echo "After=local-fs.target"                                                     | sudo tee -a "$FBSVC" > /dev/null
+          #echo "Before=NetworkManager.service"                                             | sudo tee -a "$FBSVC" > /dev/null
+          #echo "After=local-fs.target"                                                     | sudo tee -a "$FBSVC" > /dev/null
+          echo "After=NetworkManager.service"                                             | sudo tee -a "$FBSVC" > /dev/null
           echo "Wants=NetworkManager.service"                                              | sudo tee -a "$FBSVC" > /dev/null
           echo "ConditionPathExists=/usr/local/bin/efinder-firstboot.sh"                   | sudo tee -a "$FBSVC" > /dev/null
           echo ""                                                                           | sudo tee -a "$FBSVC" > /dev/null
@@ -515,6 +534,12 @@ jobs:
           VENV=/home/efinder/venv-efinder
           APP_SCRIPT=eFinder_tetra3rs_mp.py
 
+          # udev rule: unblock wifi and set regulatory domain as soon as
+          # wlan0 appears — fires before NetworkManager, no ordering dependency
+          UDEV=$ROOT/etc/udev/rules.d/99-efinder-wifi.rules
+          echo 'SUBSYSTEM=="rfkill", ATTR{type}=="wlan", ATTR{soft}="0"'          | sudo tee    "$UDEV" > /dev/null
+          echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/sbin/iw reg set US"' | sudo tee -a "$UDEV" > /dev/null
+          
           # ------------------------------------------------------------------
           # fstab — tmpfs mounts to reduce SD card wear
           # ------------------------------------------------------------------
@@ -737,9 +762,9 @@ jobs:
           sudo chroot /mnt/pi raspi-config nonint do_i2c 0        2>/dev/null || true
           sudo chroot /mnt/pi raspi-config nonint do_serial_cons 1 2>/dev/null || true
 
-          # Locale generation (needs chroot to run locale-gen binary)
-          sudo chroot /mnt/pi /usr/sbin/locale-gen
-          sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
+          ## Locale generation (needs chroot to run locale-gen binary)
+          #sudo chroot /mnt/pi /usr/sbin/locale-gen
+          #sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
 
           # Purge packages only needed during image build, not at runtime
           sudo chroot /mnt/pi apt-get purge -y \
@@ -754,7 +779,15 @@ jobs:
           sudo rm -rf /mnt/pi/usr/share/man/*
           sudo rm -rf /mnt/pi/usr/share/info/*
 
-          # Non-English locale data (~30-50MB)
+          ## Non-English locale data (~30-50MB)
+          #sudo find /mnt/pi/usr/share/locale -mindepth 1 -maxdepth 1 \
+          #    ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
+          #    -exec rm -rf {} + 2>/dev/null || true
+          #sudo find /mnt/pi/usr/share/i18n/locales -mindepth 1 \
+          #    ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
+          #    -exec rm -rf {} + 2>/dev/null || true
+          
+          # Non-English locale data
           sudo find /mnt/pi/usr/share/locale -mindepth 1 -maxdepth 1 \
               ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
               -exec rm -rf {} + 2>/dev/null || true
@@ -762,6 +795,11 @@ jobs:
               ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
               -exec rm -rf {} + 2>/dev/null || true
 
+          # Generate locale AFTER purge so output isn't deleted
+          sudo chroot /mnt/pi /usr/sbin/locale-gen
+          sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
+          sudo chroot /mnt/pi locale -a
+          
           # Python __pycache__ — regenerates on first run
           sudo find /mnt/pi/home/efinder/venv-efinder -name '__pycache__' \
               -exec rm -rf {} + 2>/dev/null || true
