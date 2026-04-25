@@ -381,7 +381,6 @@ jobs:
 
           sudo chroot /mnt/pi apt-get update -q
           sudo chroot /mnt/pi apt-get install -y --no-install-recommends \
-              # git \
               python3-pip \
               python3-venv \
               python3-numpy \
@@ -395,8 +394,8 @@ jobs:
               php \
               libapache2-mod-php \
               iw \
-              # wireless-tools \
               unzip
+              # git wireless-tools
 
       - name: Set up Python venv and install packages in chroot
         run: |
