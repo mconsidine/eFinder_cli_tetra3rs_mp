@@ -270,6 +270,9 @@ jobs:
           FBSCRIPT=$ROOT/usr/local/bin/efinder-firstboot.sh
           echo "#!/bin/bash"                                                                | sudo tee    "$FBSCRIPT" > /dev/null
           echo "set -e"                                                                     | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "# Unblock WiFi and set regulatory domain before NM starts AP"              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "rfkill unblock wifi 2>/dev/null || true"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "iw reg set US 2>/dev/null || true"                                         | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "NM=/etc/NetworkManager/system-connections/efinder-ap.nmconnection"         | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "MAC=\$(cat /sys/class/net/wlan0/address 2>/dev/null || echo '')"           | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "if [ -n \"\$MAC\" ]; then"                                                 | sudo tee -a "$FBSCRIPT" > /dev/null
@@ -289,7 +292,8 @@ jobs:
           FBSVC=$ROOT/etc/systemd/system/efinder-firstboot.service
           echo "[Unit]"                                                                     | sudo tee    "$FBSVC" > /dev/null
           echo "Description=eFinder first-boot SSID configuration"                         | sudo tee -a "$FBSVC" > /dev/null
-          echo "After=NetworkManager.service"                                              | sudo tee -a "$FBSVC" > /dev/null
+          echo "Before=NetworkManager.service"                                             | sudo tee -a "$FBSVC" > /dev/null
+          echo "After=local-fs.target"                                                     | sudo tee -a "$FBSVC" > /dev/null
           echo "Wants=NetworkManager.service"                                              | sudo tee -a "$FBSVC" > /dev/null
           echo "ConditionPathExists=/usr/local/bin/efinder-firstboot.sh"                   | sudo tee -a "$FBSVC" > /dev/null
           echo ""                                                                           | sudo tee -a "$FBSVC" > /dev/null
