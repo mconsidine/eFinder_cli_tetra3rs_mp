@@ -381,21 +381,21 @@ jobs:
 
           sudo chroot /mnt/pi apt-get update -q
           sudo chroot /mnt/pi apt-get install -y --no-install-recommends \
-              git \
+              # git \
               python3-pip \
               python3-venv \
               python3-numpy \
               python3-pillow \
               python3-picamera2 \
               python3-scipy \
-              libopenblas-dev \
+              libopenblas0 \
               samba \
               samba-common-bin \
               apache2 \
               php \
               libapache2-mod-php \
               iw \
-              wireless-tools \
+              # wireless-tools \
               unzip
 
       - name: Set up Python venv and install packages in chroot
@@ -459,21 +459,45 @@ jobs:
           sudo chroot /mnt/pi cp "$DB_CACHE" "$DB_FIXED"
           echo "  Star database baked into image."
 
-      - name: Clone eFinder_cli and deploy web interface in chroot
-        run: |
-          sudo chroot /mnt/pi sudo -u efinder git clone --depth 1 \
-              --branch tetra3rs_mp \
-              https://github.com/mconsidine/eFinder_cli_tetra3rs_mp.git \
-              /home/efinder/eFinder_cli
+      #- name: Clone eFinder_cli and deploy web interface in chroot
+      #  run: |
+      #    sudo chroot /mnt/pi sudo -u efinder git clone --depth 1 \
+      #        --branch tetra3rs_mp \
+      #        https://github.com/mconsidine/eFinder_cli_tetra3rs_mp.git \
+      #        /home/efinder/eFinder_cli
 
-          # Copy Solver files from clone (supplements files already staged from repo)
-          sudo chroot /mnt/pi /bin/bash -c \
-              "find /home/efinder/eFinder_cli/Solver -maxdepth 1 -type f \
-               -exec cp {} /home/efinder/Solver/ \;"
+      #    # Copy Solver files from clone (supplements files already staged from repo)
+      #    sudo chroot /mnt/pi /bin/bash -c \
+      #        "find /home/efinder/eFinder_cli/Solver -maxdepth 1 -type f \
+      #         -exec cp {} /home/efinder/Solver/ \;"
+
+      #    # Web interface
+      #    sudo chroot /mnt/pi /bin/bash -c \
+      #        "cp -r /home/efinder/eFinder_cli/Solver/www/* /var/www/html/ 2>/dev/null || true"
+      #    sudo chroot /mnt/pi /bin/bash -c \
+      #        "[ -f /var/www/html/index.html ] && \
+      #         mv /var/www/html/index.html /var/www/html/apacheindex.html || true"
+
+      #    EFINDER_CONF=/mnt/pi/etc/apache2/conf-available/efinder.conf
+      #    echo "Timeout 3600" | sudo tee "$EFINDER_CONF" > /dev/null
+      #    sudo chroot /mnt/pi a2enconf efinder
+      #    sudo chroot /mnt/pi chmod -R 755 /var/www/html
+      #    sudo chroot /mnt/pi chown -R www-data:www-data /var/www/html
+      
+      - name: Deploy web interface into image
+        run: |
+          # Files are already in the workspace from the checkout step —
+          # no clone needed.
+
+          # Copy any Solver files not already staged
+          sudo find $GITHUB_WORKSPACE/Solver -maxdepth 1 -type f \
+              -exec sudo install -m 644 {} /mnt/pi/home/efinder/Solver/ \;
 
           # Web interface
-          sudo chroot /mnt/pi /bin/bash -c \
-              "cp -r /home/efinder/eFinder_cli/Solver/www/* /var/www/html/ 2>/dev/null || true"
+          if [ -d "$GITHUB_WORKSPACE/Solver/www" ]; then
+              sudo cp -r $GITHUB_WORKSPACE/Solver/www/* /mnt/pi/var/www/html/ \
+                  2>/dev/null || true
+          fi
           sudo chroot /mnt/pi /bin/bash -c \
               "[ -f /var/www/html/index.html ] && \
                mv /var/www/html/index.html /var/www/html/apacheindex.html || true"
@@ -483,7 +507,7 @@ jobs:
           sudo chroot /mnt/pi a2enconf efinder
           sudo chroot /mnt/pi chmod -R 755 /var/www/html
           sudo chroot /mnt/pi chown -R www-data:www-data /var/www/html
-
+          
       - name: Write static config files into image
         run: |
           ROOT=/mnt/pi
@@ -718,18 +742,38 @@ jobs:
           sudo chroot /mnt/pi /usr/sbin/locale-gen
           sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
 
-          # Slim the image
+          # Purge packages only needed during image build, not at runtime
           sudo chroot /mnt/pi apt-get purge -y \
+              python3-pip \
               protobuf-compiler build-essential cmake pkg-config libssl-dev \
               2>/dev/null || true
           sudo chroot /mnt/pi apt-get autoremove -y
           sudo chroot /mnt/pi apt-get clean
+
+          # Docs and manuals
           sudo rm -rf /mnt/pi/usr/share/doc/*
           sudo rm -rf /mnt/pi/usr/share/man/*
           sudo rm -rf /mnt/pi/usr/share/info/*
-          # Remove staged wheel and build artifacts — no longer needed
+
+          # Non-English locale data (~30-50MB)
+          sudo find /mnt/pi/usr/share/locale -mindepth 1 -maxdepth 1 \
+              ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
+              -exec rm -rf {} + 2>/dev/null || true
+          sudo find /mnt/pi/usr/share/i18n/locales -mindepth 1 \
+              ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
+              -exec rm -rf {} + 2>/dev/null || true
+
+          # Python __pycache__ — regenerates on first run
+          sudo find /mnt/pi/home/efinder/venv-efinder -name '__pycache__' \
+              -exec rm -rf {} + 2>/dev/null || true
+          sudo find /mnt/pi/usr/lib/python3 -name '__pycache__' \
+              -exec rm -rf {} + 2>/dev/null || true
+
+          # Remove staged wheel — installed into venv, no longer needed
           sudo rm -rf /mnt/pi/home/efinder/tetra3rs-src
+
           echo "  Image slimming complete."
+          df -h /mnt/pi
 
       - name: Teardown chroot
         if: always()
