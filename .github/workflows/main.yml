@@ -245,14 +245,14 @@ jobs:
           echo "[ipv6]"                      | sudo tee -a "$NM" > /dev/null
           echo "method=disabled"            | sudo tee -a "$NM" > /dev/null
           sudo chmod 600 "$NM"
-          sudo rm -f $ROOT/etc/NetworkManager/system-connections/preconfigured.nmconnection
+          # sudo rm -f $ROOT/etc/NetworkManager/system-connections/preconfigured.nmconnection
 
           # ------------------------------------------------------------------
           # WiFi regulatory domain
           # ------------------------------------------------------------------
-          sudo mkdir -p $ROOT/etc/wpa_supplicant
-          echo "country=${WIFI_COUNTRY}"                                        | sudo tee    $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
-          echo "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev"        | sudo tee -a $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
+          # sudo mkdir -p $ROOT/etc/wpa_supplicant
+          # echo "country=${WIFI_COUNTRY}"                                        | sudo tee    $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
+          # echo "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev"        | sudo tee -a $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
           # echo "update_config=1"                                                | sudo tee -a $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
           # echo "REGDOMAIN=${WIFI_COUNTRY}" | sudo tee $ROOT/etc/default/crda > /dev/null
           # echo "WIFI_COUNTRY=${WIFI_COUNTRY}" | sudo tee $ROOT/etc/default/raspiwifi > /dev/null 2>&1 || true
@@ -420,8 +420,8 @@ jobs:
               /home/efinder/venv-efinder --system-site-packages
           sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip install \
               --upgrade pip
-          sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip install \
-              --prefer-binary "Pillow>=9.0"
+          # sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip install \
+          #     --prefer-binary "Pillow>=9.0"
           sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip install \
               --prefer-binary pyserial
           sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip install \
@@ -749,7 +749,7 @@ jobs:
           # ------------------------------------------------------------------
           # Fix final ownership
           # ------------------------------------------------------------------
-          sudo chown -R ${EF_UID}:${EF_GID} $ROOT/home/efinder
+          sudo chown -R 1000:1000 $ROOT/home/efinder
           sudo chmod a+rwx $ROOT/home/efinder/uploads
           sudo chmod a+rwx $ROOT/home/efinder/Solver/images
           sudo chmod a+rwx $ROOT/home/efinder
@@ -790,9 +790,9 @@ jobs:
           sudo find /mnt/pi/usr/share/locale -mindepth 1 -maxdepth 1 \
               ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
               -exec rm -rf {} + 2>/dev/null || true
-          sudo find /mnt/pi/usr/share/i18n/locales -mindepth 1 \
-              ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
-              -exec rm -rf {} + 2>/dev/null || true
+          # sudo find /mnt/pi/usr/share/i18n/locales -mindepth 1 \
+          #     ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
+          #     -exec rm -rf {} + 2>/dev/null || true
 
           # Generate locale AFTER purge so output isn't deleted
           sudo chroot /mnt/pi /usr/sbin/locale-gen
