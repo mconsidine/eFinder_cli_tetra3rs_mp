@@ -532,6 +532,18 @@ jobs:
           # VENV=/home/efinder/venv-efinder
           APP_SCRIPT=eFinder_tetra3rs_mp.py
 
+          # Tell NetworkManager that WiFi should be enabled at boot.
+          # Without this NM's state file overrides the rfkill unblock.
+          sudo mkdir -p $ROOT/var/lib/NetworkManager
+          echo "[main]" | sudo tee \
+              $ROOT/var/lib/NetworkManager/NetworkManager.state > /dev/null
+          echo "NetworkingEnabled=true" | sudo tee -a \
+              $ROOT/var/lib/NetworkManager/NetworkManager.state > /dev/null
+          echo "WifiEnabled=true" | sudo tee -a \
+              $ROOT/var/lib/NetworkManager/NetworkManager.state > /dev/null
+          echo "WWANEnabled=false" | sudo tee -a \
+              $ROOT/var/lib/NetworkManager/NetworkManager.state > /dev/null
+
           # udev rule: unblock wifi and set regulatory domain as soon as
           # wlan0 appears — fires before NetworkManager, no ordering dependency
           UDEV=$ROOT/etc/udev/rules.d/99-efinder-wifi.rules
