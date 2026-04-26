@@ -670,7 +670,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         d.text((70, 5), txt + "      Frame %d" % frame_n, font=fnt, fill='white')
         img2 = ImageOps.expand(img2, border=5, fill='red')
         img2.save(os.path.join(home_path, 'Solver/images/capture.jpg'))
-        if frame_n > 100:
+        if frame_n > 1100:
             keep = False; frame_n = 0
 
     def _do_solve(img):
