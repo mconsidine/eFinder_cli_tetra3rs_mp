@@ -127,7 +127,7 @@ jobs:
           # ------------------------------------------------------------------
           echo "en_US.UTF-8 UTF-8" | sudo tee $ROOT/etc/locale.gen > /dev/null
           echo "LANG=en_US.UTF-8"  | sudo tee    $ROOT/etc/default/locale > /dev/null
-          echo "LC_ALL=en_US.UTF-8" | sudo tee -a $ROOT/etc/default/locale > /dev/null
+          # echo "LC_ALL=en_US.UTF-8" | sudo tee -a $ROOT/etc/default/locale > /dev/null
           echo "Etc/UTC" | sudo tee $ROOT/etc/timezone > /dev/null
           sudo ln -sf /usr/share/zoneinfo/Etc/UTC $ROOT/etc/localtime
 
@@ -253,15 +253,15 @@ jobs:
           sudo mkdir -p $ROOT/etc/wpa_supplicant
           echo "country=${WIFI_COUNTRY}"                                        | sudo tee    $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
           echo "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev"        | sudo tee -a $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
-          echo "update_config=1"                                                | sudo tee -a $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
-          echo "REGDOMAIN=${WIFI_COUNTRY}" | sudo tee $ROOT/etc/default/crda > /dev/null
-          echo "WIFI_COUNTRY=${WIFI_COUNTRY}" | sudo tee $ROOT/etc/default/raspiwifi > /dev/null 2>&1 || true
+          # echo "update_config=1"                                                | sudo tee -a $ROOT/etc/wpa_supplicant/wpa_supplicant.conf > /dev/null
+          # echo "REGDOMAIN=${WIFI_COUNTRY}" | sudo tee $ROOT/etc/default/crda > /dev/null
+          # echo "WIFI_COUNTRY=${WIFI_COUNTRY}" | sudo tee $ROOT/etc/default/raspiwifi > /dev/null 2>&1 || true
 
-          # rfkill: ensure wifi unblocked at first boot
-          sudo mkdir -p $ROOT/var/lib/systemd/rfkill
-          for f in $ROOT/var/lib/systemd/rfkill/*:wlan; do
-              [ -f "$f" ] && echo 0 | sudo tee "$f" > /dev/null
-          done
+          ## rfkill: ensure wifi unblocked at first boot
+          # sudo mkdir -p $ROOT/var/lib/systemd/rfkill
+          # for f in $ROOT/var/lib/systemd/rfkill/*:wlan; do
+          #     [ -f "$f" ] && echo 0 | sudo tee "$f" > /dev/null
+          # done
 
           # ------------------------------------------------------------------
           # Firstboot service — reads real MAC, updates AP SSID, self-destructs
@@ -392,10 +392,8 @@ jobs:
 
       - name: Install packages in chroot
         run: |
-          # Trixie is recent — apt update/upgrade not required on a fresh image.
-          # Uncomment the two lines below if the base image is more than
-          # ~3 months old and packages may have drifted:
-          # sudo chroot /mnt/pi apt-get update -q
+          # apt-get upgrade not required on a fresh Trixie image.
+          # Uncomment if the base image is more than ~3 months old:
           # sudo chroot /mnt/pi apt-get upgrade -y
 
           sudo chroot /mnt/pi apt-get update -q
@@ -529,9 +527,9 @@ jobs:
       - name: Write static config files into image
         run: |
           ROOT=/mnt/pi
-          EFINDER_HOME=/home/efinder
-          EFINDER_USER=efinder
-          VENV=/home/efinder/venv-efinder
+          # EFINDER_HOME=/home/efinder
+          # EFINDER_USER=efinder
+          # VENV=/home/efinder/venv-efinder
           APP_SCRIPT=eFinder_tetra3rs_mp.py
 
           # udev rule: unblock wifi and set regulatory domain as soon as
@@ -624,7 +622,7 @@ jobs:
           echo "nmcli connection up efinder-ap"                                                 | sudo tee -a "$AP" > /dev/null
           echo "echo \"AP active. SSH: ssh efinder@192.168.50.1\""                             | sudo tee -a "$AP" > /dev/null
           sudo chmod +x "$AP"
-          sudo chown ${EF_UID}:${EF_GID} "$AP"
+          sudo chown 1000:1000 "$AP"
 
           # ------------------------------------------------------------------
           # Systemd service units
@@ -769,8 +767,9 @@ jobs:
           # Purge packages only needed during image build, not at runtime
           sudo chroot /mnt/pi apt-get purge -y \
               python3-pip \
-              protobuf-compiler build-essential cmake pkg-config libssl-dev \
               2>/dev/null || true
+              # protobuf-compiler build-essential cmake pkg-config libssl-dev \
+              
           sudo chroot /mnt/pi apt-get autoremove -y
           sudo chroot /mnt/pi apt-get clean
 
