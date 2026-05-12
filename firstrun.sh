@@ -1,6 +1,12 @@
 #!/bin/bash
-# firstrun.sh — staged into the image at build time, runs once on first boot.
-# Waits for internet, clones the repo, runs install.sh, then reboots.
+# firstrun.sh — staged into the image at build time, runs once on first boot
+# (gated by /home/efinder/.run_firstrun).
+#
+# The CI image already pre-stages Solver/, the tetra3rs wheel and the venv.
+# This script is the manual-rebuild path: when a user touches
+# /home/efinder/.run_firstrun and reboots, we re-clone the repo (master copy)
+# over /home/efinder/Solver. Useful for development or recovering a
+# corrupted Solver/ tree without re-flashing.
 set -e
 LOG=/home/efinder/firstrun.log
 exec > >(tee -a "$LOG") 2>&1
@@ -29,24 +35,28 @@ fi
 # Fix ownership now that the efinder user exists at runtime
 chown -R efinder:efinder /home/efinder
 
-# Load baked-in credentials from config.env
-source /home/efinder/config.env
-export WIFI_PASS SAMBA_PASS
+# Clone the correct repo (dev branch, matching the image build pipeline)
+REPO_URL=https://github.com/mconsidine/eFinder_cli_tetra3rs_mp.git
+REPO_BRANCH=dev
+REPO_DIR=/home/efinder/eFinder_cli_tetra3rs_mp
 
-# Clone the repo (tiny_img branch)
 cd /home/efinder
-if [ -d eFinder_cli ]; then
+if [ -d "$REPO_DIR" ]; then
     echo "Repo already present -- pulling latest..."
-    git -C eFinder_cli fetch origin
-    git -C eFinder_cli reset --hard origin/tiny_img
+    git -C "$REPO_DIR" fetch origin
+    git -C "$REPO_DIR" reset --hard "origin/${REPO_BRANCH}"
 else
-    git clone --branch tiny_img \
-        https://github.com/mconsidine/eFinder_cli.git eFinder_cli
+    git clone --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"
 fi
-chown -R efinder:efinder /home/efinder/eFinder_cli
+chown -R efinder:efinder "$REPO_DIR"
 
-# Run installer non-interactively
-bash /home/efinder/eFinder_cli/install.sh --non-interactive
+# Refresh Solver/ from the freshly-cloned tree (preserves images/, uploads/,
+# eFinder.config edits made by the user via the web UI).
+if [ -d "$REPO_DIR/Solver" ]; then
+    rsync -a --exclude='images/' --exclude='eFinder.config' \
+        "$REPO_DIR/Solver/" /home/efinder/Solver/
+    chown -R efinder:efinder /home/efinder/Solver
+fi
 
 # Remove trigger file so firstrun.service skips on all subsequent boots.
 # To re-run: touch /home/efinder/.run_firstrun && sudo reboot
