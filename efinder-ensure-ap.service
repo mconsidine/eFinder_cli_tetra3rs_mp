@@ -1,0 +1,18 @@
+[Unit]
+Description=Ensure eFinder Wi-Fi AP is active
+After=NetworkManager.service network.target
+Wants=NetworkManager.service
+# Run on every boot (no ConditionPathExists guard).
+# All operations are idempotent: if the AP is already up the script
+# exits immediately; if it isn't it activates it.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/efinder-ensure-ap.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

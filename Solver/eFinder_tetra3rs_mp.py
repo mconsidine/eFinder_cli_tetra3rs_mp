@@ -264,11 +264,17 @@ def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     def _apply(exp_s, gain):
         picam2.stop()
+        exp_us = int(float(exp_s) * 1_000_000)
         picam2.set_controls({
             "AeEnable":     False,
             "AwbEnable":    False,
-            "ExposureTime": int(float(exp_s) * 1_000_000),
+            "ExposureTime": exp_us,
             "AnalogueGain": int(float(gain)),
+            # Min = exposure time (physics floor).  Max = large sentinel so
+            # the ISP sets the actual frame-rate ceiling. Without this the
+            # default cap can be exposure+200ms, limiting throughput to
+            # 2.5 fps at 0.2s exposure even when the solver wants frames sooner.
+            "FrameDurationLimits": (exp_us, 1_000_000_000),
         })
         picam2.start()
 
@@ -670,7 +676,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         d.text((70, 5), txt + "      Frame %d" % frame_n, font=fnt, fill='white')
         img2 = ImageOps.expand(img2, border=5, fill='red')
         img2.save(os.path.join(home_path, 'Solver/images/capture.jpg'))
-        if frame_n > 100:
+        if frame_n > 1100:
             keep = False; frame_n = 0
 
     def _do_solve(img):
@@ -679,6 +685,16 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         t0 = time.time()
         np_img = img if img.dtype == np.uint8 else img.astype(np.uint8)
+
+        # Dark-frame fast-path: skip Rust FFI entirely when there is no
+        # real signal.  np_img.max() costs ~0.1 ms (numpy vectorised on a
+        # 960x760 uint8 array); avoiding extract_centroids saves 50-300 ms
+        # per frame with the lens cap on, overcast sky, or blank wall.
+        # 20 ADU is well above read noise (~2-4 ADU) but below any real star.
+        local_peak = int(np_img.max())
+        if local_peak < 20:
+            solve = False
+            return False
 
         # tetra3rs centroid extraction — returns ExtractionResult with
         # centroids already in centred pixel space, brightest first.
@@ -1090,6 +1106,17 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
             try:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception: pass
+            # TCP keepalives detect dead links (dropped WiFi, phone out of
+            # range) without waiting for the recv timeout.
+            # After 10 s idle: probe every 5 s, drop after 3 failures
+            # (worst-case detection ~25 s vs a 30 s recv timeout).
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            try:
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except AttributeError:
+                pass  # TCP_KEEPIDLE etc. are Linux-only; SO_KEEPALIVE still helps
             print('[lx200] SkySafari connected from', address)
             while True:
                 data = client.recv(1024)
@@ -1114,6 +1141,11 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
 
                     if   x == ':GR':  client.send(raPacket.encode('ascii'))
                     elif x == ':GD':  client.send(decPacket.encode('ascii'))
+                    # Mount type query: SkySafari sends :GW# immediately on
+                    # connect and blocks waiting for a '#'-terminated reply.
+                    # Without this handler the init handshake stalls.
+                    # AT2# = AltAz mount, Tracking, 2-star aligned.
+                    elif cmd == 'GW': client.send(b'AT2#')
 
                     elif cmd == 'St': client.send(b'1')
                     elif cmd == 'Sg': client.send(b'1')
