@@ -76,9 +76,18 @@ for i in $(seq 1 15); do
 done
 [ -z "$IP" ] && IP=$(hostname -I | awk '{print $1}')
 
+# Don't let the new station profile compete with AP on next boot, and clear
+# any NM "autoconnect-blocked" runtime flag on the AP profile so the Pi will
+# come back up as a hotspot after we power-cycle. The autoconnect-retries=0
+# write is what actually clears the blocked flag in NM.
+sudo nmcli con mod "$SSID" connection.autoconnect no 2>/dev/null || true
+sudo nmcli con mod efinder-ap connection.autoconnect yes \
+    connection.autoconnect-retries 0 2>/dev/null || true
+
 echo ""
 echo "Connected to : $SSID"
 echo "IP Address   : $IP"
 echo "Hostname     : efinder.local"
 echo ""
 echo "You can now run: sudo bash ~/install.sh"
+echo "Run ~/ap.sh to return to AP mode."

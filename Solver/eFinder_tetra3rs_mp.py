@@ -31,7 +31,9 @@
 #
 # /dev/shm/efinder_state.json  written by solver after each solve — slow
 #   telemetry (stars, peak, eTime, etc.) read by lx200 only for diagnostic
-#   commands (:GS, :GK, :Gt) which are not timing-critical.
+#   commands (:GS, :GK, :GE) which are not timing-critical.
+#   :Gt / :Gg now return SkySafari-format lat/lon (set via :St/:Sg);
+#   per-solve elapsed seconds moved from :Gt to :GE.
 
 import os
 import sys
@@ -54,7 +56,7 @@ import numpy as np
 # Shared constants
 # ---------------------------------------------------------------------------
 home_path   = str(Path.home())
-version     = "6.6-tetra3rs-mp-tb8"
+version     = "6.7-tetra3rs-mp-tb9"
 config_path = os.path.join(home_path, "Solver/eFinder.config")
 solver_path = os.path.join(home_path, "Solver")
 
@@ -272,8 +274,8 @@ def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             "AnalogueGain": int(float(gain)),
             # Min = exposure time (physics floor).  Max = large sentinel so
             # the ISP sets the actual frame-rate ceiling. Without this the
-            # default cap can be exposure+200ms, limiting throughput to
-            # 2.5 fps at 0.2s exposure even when the solver wants frames sooner.
+            # default cap is exposure+200ms, limiting throughput to 2.5 fps
+            # at 0.2s exposure even when the solver wants frames sooner.
             "FrameDurationLimits": (exp_us, 1_000_000_000),
         })
         picam2.start()
@@ -411,6 +413,104 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     except Exception:
         fnt = ImageFont.load_default()
 
+    # --- IMU (BNO055) dead-reckoning ---
+    # Gated by eFinder.config "accelerometer:true". When the IMU is present
+    # and the last plate-solve is younger than IMU_DR_MAX_AGE_S, a failed
+    # solve falls back to estimating the current pointing from the IMU
+    # rotation delta since the last good solve. We treat the celestial
+    # direction at t0 as if it were in the IMU's world frame: applying the
+    # body rotation q(t1) * q(t0)^-1 to the unit vector at (ra0, dec0)
+    # yields the new pointing direction. This is exact for a rigid scope,
+    # provided the IMU world frame does not drift relative to the celestial
+    # frame over the interval — true to well within an arcminute over
+    # seconds, since the gyro biases are tiny and we are not relying on
+    # the magnetometer for short-term updates.
+    _imu = None
+    _imu_ref_quat  = None
+    _imu_ref_radec = None
+    _imu_ref_time  = 0.0
+    IMU_DR_MAX_AGE_S = 30.0
+
+    if str(param.get('accelerometer', 'false')).strip().lower() == 'true':
+        try:
+            import board
+            import adafruit_bno055
+            _imu_i2c = board.I2C()
+            _imu = adafruit_bno055.BNO055_I2C(_imu_i2c)
+            print('[solver] BNO055 IMU initialised')
+        except Exception as _imu_e:
+            print('[solver] IMU not available:', _imu_e)
+            _imu = None
+
+    def _quat_mul(a, b):
+        aw, ax, ay, az = a
+        bw, bx, by, bz = b
+        return (aw*bw - ax*bx - ay*by - az*bz,
+                aw*bx + ax*bw + ay*bz - az*by,
+                aw*by - ax*bz + ay*bw + az*bx,
+                aw*bz + ax*by - ay*bx + az*bw)
+
+    def _quat_rotate(q, v):
+        # Rotate 3-vector v by quaternion q (w, x, y, z)
+        qw, qx, qy, qz = q
+        # Hamilton product q * (0, v) * q^-1
+        vw, vx, vy, vz = 0.0, v[0], v[1], v[2]
+        # q * v
+        rw = qw*vw - qx*vx - qy*vy - qz*vz
+        rx = qw*vx + qx*vw + qy*vz - qz*vy
+        ry = qw*vy - qx*vz + qy*vw + qz*vx
+        rz = qw*vz + qx*vy - qy*vx + qz*vw
+        # result * q^-1 (= conjugate for unit quaternion)
+        cw, cx, cy, cz = qw, -qx, -qy, -qz
+        ox = rw*cx + rx*cw + ry*cz - rz*cy
+        oy = rw*cy - rx*cz + ry*cw + rz*cx
+        oz = rw*cz + rx*cy - ry*cx + rz*cw
+        return (ox, oy, oz)
+
+    def _radec_to_vec(ra_deg, dec_deg):
+        ra_r = math.radians(ra_deg); dec_r = math.radians(dec_deg)
+        cd = math.cos(dec_r)
+        return (cd * math.cos(ra_r), cd * math.sin(ra_r), math.sin(dec_r))
+
+    def _vec_to_radec(v):
+        norm = math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]) or 1.0
+        x, y, z = v[0]/norm, v[1]/norm, v[2]/norm
+        dec = math.degrees(math.asin(max(-1.0, min(1.0, z))))
+        ra  = math.degrees(math.atan2(y, x)) % 360.0
+        return ra, dec
+
+    def _imu_read_quat():
+        if _imu is None: return None
+        try:
+            q = _imu.quaternion   # (w, x, y, z); driver may return None entries
+            if q is None: return None
+            if any(c is None for c in q): return None
+            return tuple(float(c) for c in q)
+        except Exception:
+            return None
+
+    def _imu_update_reference(ra_deg, dec_deg):
+        nonlocal _imu_ref_quat, _imu_ref_radec, _imu_ref_time
+        q = _imu_read_quat()
+        if q is None: return
+        _imu_ref_quat  = q
+        _imu_ref_radec = (ra_deg, dec_deg)
+        _imu_ref_time  = time.time()
+
+    def _imu_dead_reckon():
+        """Return (ra_deg, dec_deg) estimated from IMU delta, or None."""
+        if _imu_ref_quat is None: return None
+        if time.time() - _imu_ref_time > IMU_DR_MAX_AGE_S: return None
+        q_now = _imu_read_quat()
+        if q_now is None: return None
+        # q_delta = q_now * conj(q_ref)
+        qr = _imu_ref_quat
+        qr_conj = (qr[0], -qr[1], -qr[2], -qr[3])
+        q_delta = _quat_mul(q_now, qr_conj)
+        v0 = _radec_to_vec(_imu_ref_radec[0], _imu_ref_radec[1])
+        v1 = _quat_rotate(q_delta, v0)
+        return _vec_to_radec(v1)
+
     # --- FOV calibration ---
     _fov_samples  = []
     _FOV_MIN, _FOV_MAX = 5, 20
@@ -522,6 +622,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     # solver state
     solve         = False
+    _dr_active    = [False]   # mutable so closures can see updates
     solved_radec  = (0.0, 0.0)
     solution      = None
     centroids_last = []
@@ -558,7 +659,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         s = {
             'ra':              solved_radec[0] / 15.0,
             'dec':             solved_radec[1],
-            'solve_status':    'Solved' if solve else 'No solve',
+            'solve_status':    'Solved' if solve else ('Estimated' if _dr_active[0] else 'No solve'),
             'solve_timestamp': int(time.time()),
             'stars':           stars,
             'peak':            peak,
@@ -799,6 +900,10 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         # Zero-copy hot path — SkySafari :GR/:GD read these directly.
         shared_ra.value  = ra
         shared_dec.value = dec
+
+        # Capture the IMU orientation at the moment of this good solve so a
+        # later failed solve can dead-reckon from this reference.
+        _imu_update_reference(ra, dec)
 
         try:
             print('[solver] JNow', coordinates.hh2dms(ra / 15),
@@ -1056,7 +1161,23 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
             last_solved_seq = seq_before
 
-            _do_solve(img)
+            solved_ok = _do_solve(img)
+            if solved_ok:
+                _dr_active[0] = False
+            else:
+                # Plate-solve failed (dark frame, clouds, or below the
+                # min-stars threshold). If the IMU has a recent reference,
+                # publish an extrapolated RA/Dec so SkySafari sees the
+                # estimated pointing rather than stale numbers.
+                est = _imu_dead_reckon()
+                if est is not None:
+                    _dr_active[0] = True
+                    shared_ra.value  = est[0]
+                    shared_dec.value = est[1]
+                    _snapshot_state()
+                    print('[solver] dead-reckon: RA %.4f Dec %.4f' % est)
+                else:
+                    _dr_active[0] = False
             _write_live(img)
             print('[solver] ****************')
 
@@ -1097,6 +1218,22 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
     raStr = decStr = ''
     timeOffset = '0'; timeStr = '23:00:00'
 
+    # Observer site stored by :St (lat) and :Sg (lon). SkySafari sends these
+    # at connect; we echo them back via :Gt / :Gg in standard LX200 format.
+    # Defaults are harmless placeholders if the client queries before setting.
+    site_lat = '+00*00:00'
+    site_lon = '000*00:00'
+
+    # TTL cache for the hot-path :GR/:GD packets. SkySafari polls these at
+    # 5-10 Hz; the underlying solved position only updates at the solve
+    # cadence (~2-5 Hz). Caching the formatted reply for 100 ms drops the
+    # multiprocessing.Value lock + hh2dms/dd2aligndms cost for the bursty
+    # repeat polls in between solves.
+    _CACHE_TTL_S = 0.10
+    _cache_ts = 0.0
+    _cached_ra_pkt  = b''
+    _cached_dec_pkt = b''
+
     while True:
         try:
             client, address = s.accept()
@@ -1130,25 +1267,38 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                 time.sleep(0.001)
 
                 # Hot path: read directly from shared memory — no IPC.
-                ra  = shared_ra.value
-                dec = shared_dec.value
-                raPacket  = coordinates.hh2dms(ra / 15) + '#'
-                decPacket = coordinates.dd2aligndms(dec) + '#'
+                # 100 ms TTL cache avoids re-locking shared_ra/shared_dec
+                # and re-running hh2dms/dd2aligndms for back-to-back polls.
+                now = time.time()
+                if now - _cache_ts >= _CACHE_TTL_S:
+                    ra  = shared_ra.value
+                    dec = shared_dec.value
+                    _cached_ra_pkt  = (coordinates.hh2dms(ra / 15) + '#').encode('ascii')
+                    _cached_dec_pkt = (coordinates.dd2aligndms(dec) + '#').encode('ascii')
+                    _cache_ts = now
+                raPacket  = _cached_ra_pkt
+                decPacket = _cached_dec_pkt
 
                 for x in pkt.split('#'):
                     if not x: continue
                     cmd = x[1:3]
 
-                    if   x == ':GR':  client.send(raPacket.encode('ascii'))
-                    elif x == ':GD':  client.send(decPacket.encode('ascii'))
+                    if   x == ':GR':  client.send(raPacket)
+                    elif x == ':GD':  client.send(decPacket)
                     # Mount type query: SkySafari sends :GW# immediately on
                     # connect and blocks waiting for a '#'-terminated reply.
                     # Without this handler the init handshake stalls.
                     # AT2# = AltAz mount, Tracking, 2-star aligned.
                     elif cmd == 'GW': client.send(b'AT2#')
 
-                    elif cmd == 'St': client.send(b'1')
-                    elif cmd == 'Sg': client.send(b'1')
+                    elif cmd == 'St':
+                        # SkySafari sets observer latitude (sDD*MM or sDD*MM:SS)
+                        site_lat = x[3:]
+                        client.send(b'1')
+                    elif cmd == 'Sg':
+                        # SkySafari sets observer longitude (DDD*MM or DDD*MM:SS)
+                        site_lon = x[3:]
+                        client.send(b'1')
                     elif cmd == 'SG':
                         if len(x) > 5:
                             client.send(b'1'); timeOffset = x[3:]
@@ -1202,7 +1352,16 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                     elif cmd == 'GK':
                         client.send((':GK' + _read_state('peak','0') + '#').encode('ascii'))
                     elif cmd == 'Gt':
-                        client.send((':Gt' + _read_state('solve_time','00.00') + '#').encode('ascii'))
+                        # Standard LX200 latitude. Reply with whatever the
+                        # client last set via :St (or the placeholder default).
+                        client.send((site_lat + '#').encode('ascii'))
+                    elif cmd == 'Gg':
+                        # Standard LX200 longitude.
+                        client.send((site_lon + '#').encode('ascii'))
+                    elif cmd == 'GE':
+                        # eFinder custom: per-solve elapsed seconds (was
+                        # :Gt prior to v6.7).
+                        client.send((':GE' + _read_state('solve_time','00.00') + '#').encode('ascii'))
                     elif cmd == 'SE':
                         res = _cmd('adj_exp', x[3:5])
                         client.send((':SE' + res + '#').encode('ascii'))
