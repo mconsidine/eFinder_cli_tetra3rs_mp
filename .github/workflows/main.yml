@@ -636,6 +636,27 @@ jobs:
           sudo chmod +x "$AP"
           sudo chown 1000:1000 "$AP"
 
+
+          # ------------------------------------------------------------------
+          # efinder-ensure-ap.sh — recovers AP after station-mode use
+          # ------------------------------------------------------------------
+          ENSURE_AP_SH=$ROOT/usr/local/bin/efinder-ensure-ap.sh
+          echo "#!/bin/bash"                                                                           | sudo tee    "$ENSURE_AP_SH" > /dev/null
+          echo "AP_PROFILE=\"efinder-ap\""                                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "POLL_INTERVAL=5"                                                                      | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[ \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "done"                                                                                 | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "nmcli con mod \"\$AP_PROFILE\" connection.autoconnect yes connection.autoconnect-retries 0 2>/dev/null || true" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "nmcli con up \"\$AP_PROFILE\""                                                    | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          sudo chmod 755 "$ENSURE_AP_SH"
+          sudo chown root:root "$ENSURE_AP_SH"
+
           # ------------------------------------------------------------------
           # Systemd service units
           # ------------------------------------------------------------------
@@ -744,13 +765,30 @@ jobs:
           echo "[Install]"                                                                      | sudo tee -a "$SMB_SVC" > /dev/null
           echo "WantedBy=multi-user.target"                                                    | sudo tee -a "$SMB_SVC" > /dev/null
 
+
+          # efinder-ensure-ap service
+          ENSURE_AP_SVC=$ROOT/etc/systemd/system/efinder-ensure-ap.service
+          echo "[Unit]"                                                                               | sudo tee    "$ENSURE_AP_SVC" > /dev/null
+          echo "Description=Ensure eFinder Wi-Fi AP is active"                                      | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "After=NetworkManager.service network.target"                                         | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "Wants=NetworkManager.service"                                                        | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo ""                                                                                     | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "[Service]"                                                                           | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "Type=oneshot"                                                                        | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "ExecStart=/usr/local/bin/efinder-ensure-ap.sh"                                      | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "RemainAfterExit=yes"                                                                 | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "TimeoutStartSec=120"                                                                 | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo ""                                                                                     | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "[Install]"                                                                           | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+          echo "WantedBy=multi-user.target"                                                         | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
+
           # ------------------------------------------------------------------
           # Enable all services via symlinks (systemctl enable equivalent)
           # ------------------------------------------------------------------
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
-                     apache2 smbd nmbd efinder-samba-firstboot; do
+                     apache2 smbd nmbd efinder-samba-firstboot efinder-ensure-ap; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
