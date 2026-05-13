@@ -1,0 +1,212 @@
+/* eFinder web UI -- night vision red theme.
+   Red text preserves dark adaptation in the field. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #0d0000;
+  color: #cc3300;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+header {
+  background: #080000;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid #3a0a00;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+}
+header h1 { margin: 0; font-size: 1.2rem; }
+header h1 a { color: #cc3300; text-decoration: none; }
+header nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+header nav a {
+  color: #ff5500;
+  text-decoration: none;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+}
+header nav a:hover { background: #1a0500; }
+
+main {
+  max-width: 900px;
+  margin: 1rem auto;
+  padding: 0 1rem;
+}
+
+h2 { margin-top: 0; font-weight: 500; color: #cc3300; }
+h3 { color: #cc3300; font-weight: 500; }
+
+.card {
+  background: #110000;
+  border: 1px solid #2a0800;
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.big-coords {
+  display: flex;
+  gap: 1.5rem;
+  margin: 0.5rem 0 1rem 0;
+  flex-wrap: wrap;
+}
+.big-coords > div {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.big-coords .label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #882200;
+}
+.big-coords > div > span:last-child {
+  font-size: 1.6rem;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  color: #ff5500;
+}
+
+dl.stats {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+  margin: 0.5rem 0;
+}
+dl.stats dt { color: #882200; }
+dl.stats dd { margin: 0; font-family: "SF Mono", Menlo, Consolas, monospace; }
+
+.muted { color: #882200; }
+.hint { font-size: 0.85rem; color: #882200; margin-top: 0.5rem; }
+.instruction {
+  font-size: 1.1rem;
+  background: #1a0500;
+  padding: 0.75rem 1rem;
+  border-left: 3px solid #cc3300;
+  border-radius: 4px;
+}
+
+form { margin: 0.5rem 0; }
+label {
+  display: block;
+  margin: 0.5rem 0;
+}
+label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+input[type="number"], input[type="text"], input[type="password"], select {
+  width: 100%;
+  max-width: 320px;
+  padding: 0.5rem;
+  background: #0d0000;
+  color: #cc3300;
+  border: 1px solid #3a0a00;
+  border-radius: 4px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+}
+select option { background: #0d0000; }
+details summary { font-size: 0.85rem; color: #882200; }
+details summary:hover { color: #cc3300; }
+code {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: #1a0000;
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  background: #1a0500;
+  color: #cc3300;
+  border: 1px solid #3a0a00;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+.btn:hover { background: #2a0800; }
+.btn-primary { background: #3a0a00; border-color: #cc3300; color: #ff5500; }
+.btn-primary:hover { background: #4a1000; }
+.btn-warning { background: #2a0800; border-color: #882200; }
+.btn-warning:hover { background: #3a0a00; }
+
+.alert {
+  padding: 0.75rem 1rem;
+  border-radius: 4px;
+  margin: 0.5rem 0;
+}
+.alert-error { background: #1a0000; border: 1px solid #882200; color: #ff5500; }
+.alert-warning { background: #1a0800; border: 1px solid #882200; color: #cc3300; }
+.alert-inline { color: #cc3300; font-size: 0.85rem; margin-left: 0.5rem; }
+
+.actions { margin: 1rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+pre.logs, pre.config {
+  background: #080000;
+  border: 1px solid #2a0800;
+  border-radius: 4px;
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  color: #cc3300;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.focus-score-sm {
+  font-size: 2rem;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  color: #ff5500;
+  margin: 0.25rem 0;
+}
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+.slider-row input[type="range"] {
+  flex: 1;
+  accent-color: #cc3300;
+  max-width: 180px;
+}
+.slider-row input[type="number"] {
+  width: 90px;
+  max-width: 90px;
+}
+
+.card-wide {
+  grid-column: 1 / -1;
+}
+
+.live-view {
+  background: #0a0d12;
+  border: 1px solid #252a36;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+.live-view img { display: block; width: 100%; height: auto; }
+
+@media (max-width: 600px) {
+  header { flex-direction: column; align-items: flex-start; }
+  main { padding: 0 0.75rem; }
+  .big-coords > div > span:last-child { font-size: 1.3rem; }
+}

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}eFinder Logs{% endblock %}
+{% block content %}
+<h2>Logs</h2>
+<p>
+  Last {{ n }} lines from journalctl. Useful when emailing for support.
+  <a href="{{ url_for('logs', n=200) }}">200 lines</a> &middot;
+  <a href="{{ url_for('logs', n=500) }}">500 lines</a>
+</p>
+<pre class="logs">{{ logs }}</pre>
+{% endblock %}
