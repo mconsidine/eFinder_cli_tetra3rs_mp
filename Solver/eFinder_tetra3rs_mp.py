@@ -26,7 +26,7 @@
 #   test_mode      — Value(c_bool)   lx200 sets, camera reads
 #   cmd_q          — Queue  lx200 -> solver: tuning/on-demand commands
 #   result_q       — Queue  solver -> lx200: command results
-#   cam_cmd_q      — Queue  solver -> camera: set_exp, capture_once
+#   cam_cmd_q      — Queue  solver -> camera: set_exp, captur
 #   cam_result_q   — Queue  camera -> solver: captured frames
 #
 # /dev/shm/efinder_state.json  written by solver after each solve — slow
@@ -43,6 +43,7 @@ import time
 import csv
 import json
 import ctypes
+import collections
 from datetime import datetime
 from pathlib import Path
 from multiprocessing import (
@@ -56,7 +57,7 @@ import numpy as np
 # Shared constants
 # ---------------------------------------------------------------------------
 home_path   = str(Path.home())
-version     = "6.7-tetra3rs-mp-tb11"
+version     = "6.7-tetra3rs-mp-tb12"
 config_path = os.path.join(home_path, "Solver/eFinder.config")
 solver_path = os.path.join(home_path, "Solver")
 
@@ -341,7 +342,9 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     _imu = None
     _imu_ref_quat  = None
     _imu_ref_radec = None
-    _imu_ref_time  = 0.0
+    _imu_ref_time    = 0.0
+    _imu_calib_pairs = []
+    _imu_calib_C     = None
     IMU_DR_MAX_AGE_S = 30.0
 
     if str(param.get('accelerometer', 'false')).strip().lower() == 'true':
@@ -398,10 +401,40 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         except Exception:
             return None
 
+    def _quat_delta_rotvec(q_new, q_old):
+        """Return rotation vector (axis × angle) from q_old to q_new."""
+        qow, qox, qoy, qoz = q_old
+        q_delta = _quat_mul(q_new, (qow, -qox, -qoy, -qoz))
+        dw, dx, dy, dz = q_delta
+        nrm = math.sqrt(dw*dw + dx*dx + dy*dy + dz*dz)
+        if nrm < 1e-10:
+            return (0.0, 0.0, 0.0)
+        dw /= nrm; dx /= nrm; dy /= nrm; dz /= nrm
+        angle = 2.0 * math.acos(max(-1.0, min(1.0, abs(dw))))
+        s = math.sin(angle / 2.0)
+        if angle < 1e-8 or abs(s) < 1e-10:
+            return (0.0, 0.0, 0.0)
+        return (dx / s * angle, dy / s * angle, dz / s * angle)
+
     def _imu_update_reference(ra_deg, dec_deg):
-        nonlocal _imu_ref_quat, _imu_ref_radec, _imu_ref_time
+        nonlocal _imu_ref_quat, _imu_ref_radec, _imu_ref_time, _imu_calib_pairs, _imu_calib_C
         q = _imu_read_quat()
         if q is None: return
+        if _imu_ref_quat is not None and _imu_ref_radec is not None:
+            rv = _quat_delta_rotvec(q, _imu_ref_quat)
+            d_ra = (ra_deg - _imu_ref_radec[0] + 180.0) % 360.0 - 180.0
+            d_dec = dec_deg - _imu_ref_radec[1]
+            _imu_calib_pairs.append((rv, (d_ra, d_dec)))
+            if len(_imu_calib_pairs) > 50:
+                _imu_calib_pairs = _imu_calib_pairs[-50:]
+            if len(_imu_calib_pairs) >= 3:
+                try:
+                    X = np.array([p[0] for p in _imu_calib_pairs])
+                    Y = np.array([p[1] for p in _imu_calib_pairs])
+                    C, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
+                    _imu_calib_C = C
+                except Exception:
+                    pass
         _imu_ref_quat  = q
         _imu_ref_radec = (ra_deg, dec_deg)
         _imu_ref_time  = time.time()
@@ -411,6 +444,15 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         if time.time() - _imu_ref_time > IMU_DR_MAX_AGE_S: return None
         q_now = _imu_read_quat()
         if q_now is None: return None
+        if _imu_calib_C is not None:
+            try:
+                rv = _quat_delta_rotvec(q_now, _imu_ref_quat)
+                d_sky = np.array(rv) @ _imu_calib_C
+                ra  = (_imu_ref_radec[0] + float(d_sky[0])) % 360.0
+                dec = max(-90.0, min(90.0, _imu_ref_radec[1] + float(d_sky[1])))
+                return (ra, dec)
+            except Exception:
+                pass
         qr = _imu_ref_quat
         qr_conj = (qr[0], -qr[1], -qr[2], -qr[3])
         q_delta = _quat_mul(q_now, qr_conj)
@@ -428,8 +470,8 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         _polar_aligner = None
 
     # --- FOV calibration ---
-    _fov_samples  = []
     _FOV_MIN, _FOV_MAX = 5, 30
+    _fov_samples  = collections.deque(maxlen=_FOV_MAX)
     _fov_measured = float(param.get('fov_measured', '0'))
     _calibrator   = None
     try:
@@ -458,7 +500,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                 _fov_measured = _calibrator.committed_fov
             return
         _fov_samples.append(fov_deg)
-        if len(_fov_samples) > _FOV_MAX: _fov_samples.pop(0)
         if len(_fov_samples) < _FOV_MIN: return
         avg = sum(_fov_samples) / len(_fov_samples)
         if abs(avg - _fov_measured) > 0.05:
@@ -478,6 +519,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     SEEDED_TIMEOUT_MS      = 2000
     BLIND_TIMEOUT_MS       = 5000
     RESEED_TOLERANCE_DEG   = 4.0
+    _HINT_MAX_AGE_S        = 30.0
 
     _PEAK_ATTR = None
     try:
@@ -522,18 +564,21 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         return 0
 
     # solver state
-    solve         = False
-    _dr_active    = [False]
-    solved_radec  = (0.0, 0.0)
-    solution      = None
+    solve          = False
+    _dr_active     = [False]
+    solved_radec   = (0.0, 0.0)
+    solution       = None
     centroids_last = []
-    firstCentroid = None
-    stars         = '0'
-    peak          = '0'
-    eTime         = '00.00'
-    keep          = False
-    frame_n       = 0
-    offset_str    = '%1.3f,%1.3f' % (0.0, 0.0)
+    firstCentroid  = None
+    stars          = '0'
+    peak           = '0'
+    eTime          = '00.00'
+    keep           = False
+    frame_n        = 0
+    offset_str     = '%1.3f,%1.3f' % (0.0, 0.0)
+    _detect_sigma  = float(param.get('detect_sigma', '10.0'))
+    _sol_camera_model = None
+    _last_solve_time  = 0.0
 
     _state_snapshot = {}
     _state_lock     = _Lock()
@@ -673,7 +718,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     def _do_solve(img):
         nonlocal solve, solved_radec, solution, firstCentroid, centroids_last
-        nonlocal stars, peak, eTime
+        nonlocal stars, peak, eTime, _sol_camera_model, _last_solve_time
 
         t0 = time.time()
         np_img = img if img.dtype == np.uint8 else img.astype(np.uint8)
@@ -685,7 +730,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         extraction = tetra3rs.extract_centroids(
             np_img,
-            sigma_threshold=10.0,
+            sigma_threshold=_detect_sigma,
             max_centroids=MAX_CENTROIDS,
         )
         centroid_list = extraction.centroids
@@ -711,7 +756,13 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             image_shape       = (FRAME_H, FRAME_W),
             solve_timeout_ms  = BLIND_TIMEOUT_MS,
         )
-        if solve and solution is not None:
+        if (_sol_camera_model is not None and _calibrator and
+                _calibrator.state.value == 'calibrated'):
+            try:
+                kwargs['camera_model'] = _sol_camera_model
+            except Exception:
+                pass
+        if solve and solution is not None and (time.time() - _last_solve_time) <= _HINT_MAX_AGE_S:
             try:
                 kwargs['attitude_hint']        = solution.quaternion
                 kwargs['hint_uncertainty_deg'] = 1.0
@@ -732,9 +783,15 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                     stars, param['Exposure'], param['Gain']))
             return False
 
-        solution       = sol
-        centroids_last = centroid_list
-        firstCentroid  = centroid_list[0]
+        solution         = sol
+        centroids_last   = centroid_list
+        firstCentroid    = centroid_list[0]
+        _last_solve_time = time.time()
+        try:
+            if sol.camera_model is not None:
+                _sol_camera_model = sol.camera_model
+        except Exception:
+            pass
 
         try:
             target = sol.pixel_to_world(offset_cx, offset_cy)
@@ -871,7 +928,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     def _handle(cmd, a, b):
         nonlocal solve, solved_radec, offset_cx, offset_cy, offset_str
-        nonlocal keep, frame_n, _fov_measured
+        nonlocal keep, frame_n, _fov_measured, _detect_sigma
 
         if cmd == 'adj_exp':
             new_exp = '%.1f' % max(0.1, float(param.get('Exposure','0.2'))
@@ -1008,6 +1065,37 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                 save_param(param)
             _snapshot_state()
             return 'ok'
+
+        elif cmd == 'boresight_align':
+            target_ra_deg  = float(a) if a is not None else 0.0
+            target_dec_deg = float(b) if b is not None else 0.0
+            offset_flag.value = True
+            ok = _do_solve(_request_capture())
+            if not ok:
+                offset_flag.value = False
+                return 'fail'
+            try:
+                pix = solution.world_to_pixel(target_ra_deg, target_dec_deg)
+            except Exception:
+                pix = None
+            if pix is None:
+                offset_flag.value = False
+                return 'fail'
+            px_x, px_y = pix
+            offset_cx = px_x
+            offset_cy = px_y
+            dx_deg, dy_deg = centred2dxdy(px_x, px_y)
+            param['d_x'] = '{:.2f}'.format(60 * dx_deg)
+            param['d_y'] = '{:.2f}'.format(60 * dy_deg)
+            offset_str = '%1.3f,%1.3f' % (dx_deg, dy_deg)
+            save_param(param)
+            offset_flag.value = False
+            _write_state()
+            return '1'
+
+        elif cmd == 'set_sigma':
+            _detect_sigma = max(3.0, min(30.0, float(a) if a is not None else 10.0))
+            return '%.1f' % _detect_sigma
 
         return 'ok'
 
@@ -1235,6 +1323,17 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                     return MaintResponse(ok=False, error='latitude_deg required')
                 persist = bool(args.get('persist', True))
                 qcmd, qa, qb, qtimeout = 'polar_set_latitude', float(lat), persist, 5.0
+            elif cmd == 'boresight_align':
+                ra_deg  = args.get('ra_deg')
+                dec_deg = args.get('dec_deg')
+                if ra_deg is None or dec_deg is None:
+                    return MaintResponse(ok=False, error='ra_deg and dec_deg required')
+                qcmd, qa, qb, qtimeout = 'boresight_align', float(ra_deg), float(dec_deg), 30.0
+            elif cmd == 'sigma_set':
+                sigma = args.get('sigma')
+                if sigma is None:
+                    return MaintResponse(ok=False, error='sigma required')
+                qcmd, qa, qb, qtimeout = 'set_sigma', float(sigma), None, 5.0
             else:
                 return MaintResponse(ok=False, error=f'unknown command: {cmd}')
 
@@ -1409,15 +1508,18 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                     elif cmd == 'Me': _cmd('start_images', '1')
                     elif cmd == 'CM':
                         client.send(b'0')
-                        _cmd('measure_offset', timeout=30.0)
                         try:
                             rp = raStr.split(':')
-                            targetRa = int(rp[0]) + int(rp[1])/60 + int(rp[2])/3600
+                            target_ra_h = int(rp[0]) + int(rp[1])/60 + int(rp[2])/3600
+                            target_ra_deg = target_ra_h * 15.0
                             dp = decStr.split('*'); dd = dp[1].split(':')
-                            targetDec = int(dp[0]) + math.copysign(
+                            target_dec_deg = int(dp[0]) + math.copysign(
                                 int(dd[0])/60 + int(dd[1])/3600, float(dp[0]))
-                            print('[lx200] align target:', targetRa, targetDec)
-                        except Exception: pass
+                            print('[lx200] boresight_align target: RA=%.4f Dec=%.4f' %
+                                  (target_ra_deg, target_dec_deg))
+                            _cmd('boresight_align', target_ra_deg, target_dec_deg, timeout=30.0)
+                        except Exception:
+                            _cmd('measure_offset', timeout=30.0)
                     elif x and x[-1] == 'Q':
                         _cmd('start_images', '0')
                     elif cmd == 'PS':
@@ -1532,7 +1634,7 @@ def main():
 
     try:
         while True:
-            time.sleep(30)
+            time.sleep(10)
             for name, p in list(procs.items()):
                 if not p.is_alive():
                     print('[main] %s died (exit %s) — restarting' % (name, p.exitcode))
