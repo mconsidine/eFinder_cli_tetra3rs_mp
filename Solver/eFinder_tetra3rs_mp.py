@@ -56,7 +56,7 @@ import numpy as np
 # Shared constants
 # ---------------------------------------------------------------------------
 home_path   = str(Path.home())
-version     = "6.7-tetra3rs-mp-tb10"
+version     = "6.7-tetra3rs-mp-tb11"
 config_path = os.path.join(home_path, "Solver/eFinder.config")
 solver_path = os.path.join(home_path, "Solver")
 
@@ -429,17 +429,34 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     # --- FOV calibration ---
     _fov_samples  = []
-    _FOV_MIN, _FOV_MAX = 5, 20
+    _FOV_MIN, _FOV_MAX = 5, 30
     _fov_measured = float(param.get('fov_measured', '0'))
+    _calibrator   = None
+    try:
+        from calibration import FovCalibrator as _FovCalibrator
+        _calibrator = _FovCalibrator(param, save_param, CAM_FOV_DEG, FRAME_W)
+        print('[solver] calibrator: state=%s fov=%.4f max_err=%.2f' % (
+            _calibrator.state.value, _calibrator.get_fov_estimate(),
+            _calibrator.get_fov_max_error()))
+    except Exception as _cal_e:
+        print('[solver] FovCalibrator not available:', _cal_e)
 
     def _get_fov():
-        if _fov_measured > 0 and len(_fov_samples) >= _FOV_MIN:
+        if _calibrator:
+            return _calibrator.get_fov_estimate(), _calibrator.get_fov_max_error()
+        if _fov_measured > 0:
             return _fov_measured, 0.3
         return CAM_FOV_DEG, 1.0
 
     def _update_fov(fov_deg):
         nonlocal _fov_measured
-        if not fov_deg or fov_deg <= 0: return
+        if not fov_deg or fov_deg <= 0:
+            return
+        if _calibrator:
+            _calibrator.update_from_solve(fov_deg)
+            if _calibrator.committed_fov:
+                _fov_measured = _calibrator.committed_fov
+            return
         _fov_samples.append(fov_deg)
         if len(_fov_samples) > _FOV_MAX: _fov_samples.pop(0)
         if len(_fov_samples) < _FOV_MIN: return
@@ -553,13 +570,12 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             'offset_cy':       offset_cy,
             'cpu_temp':        round(cpu_temp, 1),
             'memory_usage':    memory_mb,
-            'calibration': {
-                'state': 'calibrated' if _fov_measured > 0 and len(_fov_samples) >= _FOV_MIN
-                         else 'calibrating',
+            'calibration': (_calibrator.get_status() if _calibrator else {
+                'state': 'calibrated' if _fov_measured > 0 else 'calibrating',
                 'committed_fov': round(_fov_measured, 4) if _fov_measured > 0 else None,
                 'window_filled': len(_fov_samples),
                 'window_size': _FOV_MAX,
-            },
+            }),
             'polar': (_polar_aligner.get_status() if _polar_aligner else {
                 'state': 'idle', 'points_captured': 0, 'target_points': 3,
                 'latitude_deg': None, 'needed_action': '', 'elapsed_s': 0.0,
@@ -941,6 +957,17 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             offset_str = '%1.3f,%1.3f' % (0.0, 0.0)
             save_param(param); _write_state(); return '1'
 
+        elif cmd == 'boresight_set':
+            px_y = float(a) if a is not None else CENTRE_Y
+            px_x = float(b) if b is not None else CENTRE_X
+            offset_cx = px_x - CENTRE_X
+            offset_cy = px_y - CENTRE_Y
+            dx_deg, dy_deg = centred2dxdy(offset_cx, offset_cy)
+            param['d_x'] = '{:.2f}'.format(60 * dx_deg)
+            param['d_y'] = '{:.2f}'.format(60 * dy_deg)
+            offset_str = '%1.3f,%1.3f' % (dx_deg, dy_deg)
+            save_param(param); _write_state(); return '1'
+
         elif cmd == 'start_images':
             keep = (a == '1'); frame_n = 0 if keep else frame_n
             print('[solver] image saving:', 'on' if keep else 'off')
@@ -950,10 +977,14 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             coordinates.dateSet(*a); return '1'
 
         elif cmd == 'calibration_reset':
-            _fov_samples.clear()
-            _fov_measured = 0.0
-            param['fov_measured'] = '0'
-            save_param(param)
+            if _calibrator:
+                _calibrator.force_recalibrate()
+                _fov_measured = 0.0
+            else:
+                _fov_samples.clear()
+                _fov_measured = 0.0
+                param['fov_measured'] = '0'
+                save_param(param)
             _snapshot_state()
             return 'ok'
 
@@ -968,8 +999,13 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             return 'ok'
 
         elif cmd == 'polar_set_latitude':
+            lat = float(a) if a is not None else 0.0
+            persist = b if b is not None else True
             if _polar_aligner:
-                _polar_aligner.set_latitude(float(a) if a is not None else 0.0)
+                _polar_aligner.set_latitude(lat)
+            if persist:
+                param['latitude'] = '%.6f' % lat
+                save_param(param)
             _snapshot_state()
             return 'ok'
 
@@ -1148,11 +1184,23 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                 'gain':       float(state.get('gain', '20') or 20),
             })
 
+        elif cmd == 'boresight_show':
+            state = _read_state_json()
+            cx = float(state.get('offset_cx', 0.0))
+            cy = float(state.get('offset_cy', 0.0))
+            return MaintResponse(ok=True, result={
+                'x': CENTRE_X + cx,
+                'y': CENTRE_Y + cy,
+                'offset_cx': cx,
+                'offset_cy': cy,
+            })
+
         # --- Mutations: route through solver queue, serialise with lock ---
         else:
             # Map maint command -> solver queue command + args
             queue_map = {
                 'reset_offset':       ('reset_offset',       None, None,  10.0),
+                'boresight_center':   ('reset_offset',       None, None,  10.0),
                 'calibration_reset':  ('calibration_reset',  None, None,  10.0),
                 'polar_start':        ('polar_start',        None, None,  5.0),
                 'polar_cancel':       ('polar_cancel',       None, None,  5.0),
@@ -1169,11 +1217,24 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                 if gain is None:
                     return MaintResponse(ok=False, error='gain required')
                 qcmd, qa, qb, qtimeout = 'set_gain', float(gain), None, 10.0
+            elif cmd == 'boresight_set':
+                y = args.get('y')
+                x = args.get('x')
+                if y is None or x is None:
+                    return MaintResponse(ok=False, error='y and x required')
+                try:
+                    y, x = float(y), float(x)
+                except (ValueError, TypeError):
+                    return MaintResponse(ok=False, error='y and x must be numeric')
+                if not (0 <= y <= FRAME_H) or not (0 <= x <= FRAME_W):
+                    return MaintResponse(ok=False, error='y/x outside frame bounds')
+                qcmd, qa, qb, qtimeout = 'boresight_set', y, x, 10.0
             elif cmd == 'polar_set_latitude':
                 lat = args.get('latitude_deg')
                 if lat is None:
                     return MaintResponse(ok=False, error='latitude_deg required')
-                qcmd, qa, qb, qtimeout = 'polar_set_latitude', float(lat), None, 5.0
+                persist = bool(args.get('persist', True))
+                qcmd, qa, qb, qtimeout = 'polar_set_latitude', float(lat), persist, 5.0
             else:
                 return MaintResponse(ok=False, error=f'unknown command: {cmd}')
 
