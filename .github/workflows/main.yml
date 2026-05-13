@@ -293,20 +293,20 @@ SVCEOF
         run: |
           sudo chroot /mnt/pi /bin/bash -c "
             apt-get update -q
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                python3-pip \
-                python3-venv \
-                python3-picamera2 \
-                python3-numpy \
-                i2c-tools \
-                libi2c-dev \
-                python3-smbus \
-                libcamera-apps \
-                apache2 \
-                php \
-                libapache2-mod-php \
-                samba \
-                samba-common-bin \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \\
+                python3-pip \\
+                python3-venv \\
+                python3-picamera2 \\
+                python3-numpy \\
+                i2c-tools \\
+                libi2c-dev \\
+                python3-smbus \\
+                libcamera-apps \\
+                apache2 \\
+                php \\
+                libapache2-mod-php \\
+                samba \\
+                samba-common-bin \\
                 zram-tools
           "
 
@@ -315,11 +315,11 @@ SVCEOF
           sudo chroot /mnt/pi /bin/bash -c "
             python3 -m venv --system-site-packages /home/efinder/venv-efinder
             /home/efinder/venv-efinder/bin/pip install --upgrade pip
-            /home/efinder/venv-efinder/bin/pip install \
-                smbus2 \
-                adafruit-circuitpython-bno055 \
-                flask \
-                scipy \
+            /home/efinder/venv-efinder/bin/pip install \\
+                smbus2 \\
+                adafruit-circuitpython-bno055 \\
+                flask \\
+                scipy \\
                 pillow
           "
 
@@ -421,7 +421,7 @@ APEOF
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
-          echo "    if [[  \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[ \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
@@ -590,15 +590,18 @@ ZRAMEOF
           # ------------------------------------------------------------------
           # Enable services via symlinks
           # apache2 is installed but NOT enabled; efinder-webui serves port 80.
+          # zramswap is installed by zram-tools to /lib/systemd/system/ not
+          # /etc/systemd/system/, so it needs its own symlink.
           # ------------------------------------------------------------------
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
-                     efinder-webui smbd nmbd efinder-samba-firstboot efinder-ensure-ap \
-                     zramswap; do
+                     efinder-webui smbd nmbd efinder-samba-firstboot efinder-ensure-ap; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
+          sudo ln -sf /lib/systemd/system/zramswap.service \
+              "$WANTS/zramswap.service" 2>/dev/null || true
           sudo ln -sf /lib/systemd/system/ssh.service \
               $ROOT/etc/systemd/system/multi-user.target.wants/ssh.service 2>/dev/null || true
 
