@@ -131,6 +131,27 @@ jobs:
           sudo mkdir -p $ROOT/etc/NetworkManager/system-connections
 
           # -----------------------------------------------------------------------
+          # Boot partition: USB gadget mode + camera
+          # -----------------------------------------------------------------------
+          CONFIG_TXT=$ROOT/boot/firmware/config.txt
+          CMDLINE_TXT=$ROOT/boot/firmware/cmdline.txt
+          for setting in "camera_auto_detect=1" "enable_uart=1" "dtoverlay=imx477"; do
+            sudo grep -qF "$setting" "$CONFIG_TXT" || \
+                echo "$setting" | sudo tee -a "$CONFIG_TXT" > /dev/null
+          done
+          if ! sudo grep -qxF "dtoverlay=dwc2,dr_mode=peripheral" "$CONFIG_TXT"; then
+            printf "\n[all]\n# USB serial gadget -- peripheral mode for Pi Zero / Zero 2W\ndtoverlay=dwc2,dr_mode=peripheral\n" \
+                | sudo tee -a "$CONFIG_TXT" > /dev/null
+          fi
+          if ! sudo grep -q "console=ttyGS0" "$CMDLINE_TXT"; then
+            if sudo grep -q "rootwait" "$CMDLINE_TXT"; then
+              sudo sed -i 's/rootwait/rootwait console=ttyGS0,115200/' "$CMDLINE_TXT"
+            else
+              sudo sed -i '1s/^/console=ttyGS0,115200 /' "$CMDLINE_TXT"
+            fi
+          fi
+
+          # -----------------------------------------------------------------------
           # NetworkManager AP profile
           # -----------------------------------------------------------------------
           NM=$ROOT/etc/NetworkManager/system-connections/efinder-ap.nmconnection
@@ -269,7 +290,8 @@ jobs:
                 libapache2-mod-php \
                 samba \
                 samba-common-bin \
-                zram-tools
+                zram-tools \
+                initramfs-tools
             dpkg --configure -a || true
           "
 
@@ -292,6 +314,11 @@ jobs:
           sudo chroot /mnt/pi /bin/bash -c "
             /home/efinder/venv-efinder/bin/pip install /home/efinder/tetra3rs-src/$(basename $WHEEL)
           "
+
+      - name: Update initramfs for USB gadget (dwc2)
+        run: |
+          sudo chroot /mnt/pi update-initramfs -u -k all || \
+              echo "WARNING: update-initramfs failed (non-fatal)"
 
       - name: Configure Apache for optional use
         run: |
@@ -522,6 +549,23 @@ jobs:
           echo "WantedBy=multi-user.target"                                                         | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
 
           # ------------------------------------------------------------------
+          # USB gadget: configfs ACM setup script and service
+          # ------------------------------------------------------------------
+          sudo install -m 755 image-config/efinder-gadget-connect \
+              $ROOT/usr/local/bin/efinder-gadget-connect
+
+          USB_GADGET_SVC=$ROOT/etc/systemd/system/efinder-usb-gadget.service
+          sudo cp image-config/efinder-usb-gadget.service "$USB_GADGET_SVC"
+
+          sudo mkdir -p $ROOT/etc/modules-load.d
+          sudo cp image-config/efinder-gadget.conf \
+              $ROOT/etc/modules-load.d/efinder-gadget.conf
+
+          sudo mkdir -p $ROOT/etc/initramfs-tools
+          grep -qxF "dwc2" $ROOT/etc/initramfs-tools/modules 2>/dev/null || \
+              echo "dwc2" | sudo tee -a $ROOT/etc/initramfs-tools/modules > /dev/null
+
+          # ------------------------------------------------------------------
           # Zram swap configuration
           # ------------------------------------------------------------------
           sudo cp image-config/zramswap "$ROOT/etc/default/zramswap"
@@ -533,7 +577,8 @@ jobs:
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
-                     efinder-webui smbd nmbd efinder-samba-firstboot efinder-ensure-ap; do
+                     efinder-webui smbd nmbd efinder-samba-firstboot \
+                     efinder-ensure-ap efinder-usb-gadget; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
@@ -541,6 +586,8 @@ jobs:
               "$WANTS/zramswap.service" 2>/dev/null || true
           sudo ln -sf /lib/systemd/system/ssh.service \
               $ROOT/etc/systemd/system/multi-user.target.wants/ssh.service 2>/dev/null || true
+          sudo ln -sf /lib/systemd/system/serial-getty@.service \
+              "$WANTS/serial-getty@ttyGS0.service" 2>/dev/null || true
 
           # ------------------------------------------------------------------
           # Fix final ownership

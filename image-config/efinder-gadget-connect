@@ -1,0 +1,74 @@
+#!/bin/bash
+# Configure and connect the USB serial ACM gadget using configfs (libcomposite).
+# On the host the Pi appears as /dev/ttyACM0. Use: screen /dev/ttyACM0 115200
+
+set -euo pipefail
+
+GADGET_PATH="/sys/kernel/config/usb_gadget/efinder"
+
+modprobe libcomposite
+modprobe u_serial
+modprobe usb_f_acm
+
+UDC=""
+for i in $(seq 1 40); do
+    UDC=$(ls /sys/class/udc/ 2>/dev/null | head -n1)
+    [ -n "$UDC" ] && break
+    sleep 0.5
+done
+
+if [ -z "$UDC" ]; then
+    logger -t efinder-gadget "ERROR: No UDC found in /sys/class/udc/ — gadget not configured"
+    exit 1
+fi
+logger -t efinder-gadget "Using UDC: $UDC"
+
+if ! mountpoint -q /sys/kernel/config 2>/dev/null; then
+    mount -t configfs none /sys/kernel/config
+fi
+
+if [ -d "$GADGET_PATH" ]; then
+    echo "" > "$GADGET_PATH/UDC" 2>/dev/null || true
+    rm -f "$GADGET_PATH/configs/c.1/acm.usb0" 2>/dev/null || true
+    rmdir "$GADGET_PATH/configs/c.1/strings/0x409" 2>/dev/null || true
+    rmdir "$GADGET_PATH/configs/c.1" 2>/dev/null || true
+    rmdir "$GADGET_PATH/functions/acm.usb0" 2>/dev/null || true
+    rmdir "$GADGET_PATH/strings/0x409" 2>/dev/null || true
+    rmdir "$GADGET_PATH" 2>/dev/null || true
+fi
+
+mkdir -p "$GADGET_PATH"
+cd "$GADGET_PATH"
+
+echo 0x1d6b > idVendor
+echo 0x0104 > idProduct
+echo 0x0100 > bcdDevice
+echo 0x0200 > bcdUSB
+
+echo 0x02 > bDeviceClass
+echo 0x00 > bDeviceSubClass
+echo 0x00 > bDeviceProtocol
+
+mkdir -p strings/0x409
+echo "fedcba9876543210" > strings/0x409/serialnumber
+echo "eFinder"          > strings/0x409/manufacturer
+echo "eFinder Serial"   > strings/0x409/product
+
+mkdir -p configs/c.1/strings/0x409
+echo "CDC ACM"          > configs/c.1/strings/0x409/configuration
+echo 250                > configs/c.1/MaxPower
+
+mkdir -p functions/acm.usb0
+ln -sf "$(pwd)/functions/acm.usb0" configs/c.1/acm.usb0
+
+echo "$UDC" > UDC
+logger -t efinder-gadget "Gadget configured and bound to $UDC"
+
+SC="/sys/class/udc/${UDC}/soft_connect"
+if [ -f "$SC" ]; then
+    sleep 0.5
+    echo 0 > "$SC"
+    sleep 1
+    echo 1 > "$SC"
+    logger -t efinder-gadget "soft_connect pulsed on $UDC"
+fi
