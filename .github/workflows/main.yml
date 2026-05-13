@@ -76,15 +76,21 @@ jobs:
 
       - name: Download Raspberry Pi OS Lite (arm64 / trixie)
         run: |
-          wget -q --show-progress \
-              https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2025-05-13/2025-05-13-raspios-trixie-arm64-lite.img.xz
+          BASE="https://downloads.raspberrypi.com/raspios_lite_arm64/images"
+          LATEST_DIR=$(curl -sL "${BASE}/" \
+            | grep -oP '(?<=href=")raspios_lite_arm64-\d{4}-\d{2}-\d{2}(?=/)' \
+            | sort | tail -1)
+          DATE="${LATEST_DIR#raspios_lite_arm64-}"
+          IMG_FILE="${DATE}-raspios-trixie-arm64-lite.img.xz"
+          echo "Downloading ${BASE}/${LATEST_DIR}/${IMG_FILE}"
+          wget -q --show-progress "${BASE}/${LATEST_DIR}/${IMG_FILE}"
           ls -lh *.xz
 
       - name: Decompress image
         run: |
-          xz -d 2025-05-13-raspios-trixie-arm64-lite.img.xz
+          xz -d *.img.xz
           ls -lh *.img
-          mv 2025-05-13-raspios-trixie-arm64-lite.img 2025-10-01-raspios-trixie-arm64-lite.img
+          mv *.img 2025-10-01-raspios-trixie-arm64-lite.img
 
       - name: Expand image by 4 GB
         run: |
