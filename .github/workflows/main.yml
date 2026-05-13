@@ -249,7 +249,7 @@ jobs:
           sudo mount --bind /dev/pts   /mnt/pi/dev/pts
           sudo mount --bind /proc      /mnt/pi/proc
           sudo mount --bind /sys       /mnt/pi/sys
-          echo '#!/bin/sh\nexit 101' | sudo tee /mnt/pi/usr/sbin/policy-rc.d > /dev/null
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /mnt/pi/usr/sbin/policy-rc.d > /dev/null
           sudo chmod +x /mnt/pi/usr/sbin/policy-rc.d
 
       - name: Install packages and configure system in chroot
@@ -363,7 +363,7 @@ jobs:
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
-          echo "    if [[  \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[\"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\"]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
