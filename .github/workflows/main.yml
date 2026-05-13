@@ -134,7 +134,7 @@ jobs:
           # tetra3 database
           # -----------------------------------------------------------------------
           wget -q --show-progress \
-              https://github.com/ssmichael1/tetra3rs/releases/download/latest/hip_main.h5 \
+              https://github.com/ssmichael1/tetra3rs/releases/latest/download/hip_main.h5 \
               -O /tmp/hip_main.h5
           sudo cp /tmp/hip_main.h5 $ROOT/home/efinder/Solver/
 
