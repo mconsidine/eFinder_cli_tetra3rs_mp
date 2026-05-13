@@ -144,12 +144,12 @@ jobs:
           echo "#!/bin/bash"                                                                        | sudo tee    "$FBSCRIPT" > /dev/null
           echo "set -e"                                                                             | sudo tee -a "$FBSCRIPT" > /dev/null
           echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "CURRENT_HOSTNAME=\$(cat /etc/hostname | tr -d ' \t\n\r')"                      | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "CURRENT_HOSTNAME=\$(cat /etc/hostname | tr -d ' \\t\\n\\r')"                      | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_hostname efinder"              | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    echo efinder > /etc/hostname"                                                  | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "    sed -i \"s/127.0.1.1.*\$CURRENT_HOSTNAME/127.0.1.1\tefinder/g\" /etc/hosts"  | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    sed -i \"s/127.0.1.1.*\$CURRENT_HOSTNAME/127.0.1.1\\tefinder/g\" /etc/hosts"  | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
           echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "FIRSTUSER=\$(getent passwd 1000 | cut -d: -f1)"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
@@ -363,7 +363,7 @@ jobs:
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
-          echo "    if [[\"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\"]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[  \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
@@ -570,9 +570,12 @@ jobs:
               ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
               -exec rm -rf {} + 2>/dev/null || true
 
+          sudo sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /mnt/pi/etc/locale.gen
+          grep -q '^en_US.UTF-8 UTF-8' /mnt/pi/etc/locale.gen || \
+              echo 'en_US.UTF-8 UTF-8' | sudo tee -a /mnt/pi/etc/locale.gen > /dev/null
           sudo chroot /mnt/pi /usr/sbin/locale-gen
           sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
-          sudo chroot /mnt/pi locale -a
+          sudo chroot /mnt/pi locale -a || true
 
           sudo find /mnt/pi/home/efinder/venv-efinder -name '__pycache__' \
               -exec rm -rf {} + 2>/dev/null || true
