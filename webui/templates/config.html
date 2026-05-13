@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}eFinder Configuration{% endblock %}
+{% block content %}
+<h2>Configuration</h2>
+<p>Read-only view of <code>{{ path }}</code>. SSH in to edit, or use
+   LX200 commands to change individual settings.</p>
+<pre class="config">{{ content }}</pre>
+{% endblock %}

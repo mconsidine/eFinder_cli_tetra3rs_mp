@@ -62,40 +62,278 @@ jobs:
       - name: Clone tetra3rs
         run: |
           git clone --depth 1 https://github.com/ssmichael1/tetra3rs.git
-          cd tetra3rs && echo "Built from commit: $(git rev-parse HEAD)"
 
-      - name: Cache tetra3rs build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            tetra3rs/target
-          key: tetra3rs-aarch64-${{ hashFiles('tetra3rs/python/Cargo.toml') }}
-          restore-keys: tetra3rs-aarch64-
-
-      - name: Cross-compile tetra3rs wheel for aarch64
+      - name: Build tetra3rs wheel for aarch64
         run: |
           source "$HOME/.cargo/env"
           cd tetra3rs/python
           export RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+neon"
           maturin build --release \
               --target aarch64-unknown-linux-gnu \
-              --compatibility linux \
               --zig \
-              -i python3.13 \
-              --out /tmp/tetra3rs-wheels/
+              --out /tmp/tetra3rs-wheels
           ls -lh /tmp/tetra3rs-wheels/
+
+      - name: Download Raspberry Pi OS Lite (arm64 / trixie)
+        run: |
+          wget -q --show-progress \
+              https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2025-05-13/2025-05-13-raspios-trixie-arm64-lite.img.xz
+          ls -lh *.xz
+
+      - name: Decompress image
+        run: |
+          xz -d 2025-05-13-raspios-trixie-arm64-lite.img.xz
+          ls -lh *.img
+          mv 2025-05-13-raspios-trixie-arm64-lite.img 2025-10-01-raspios-trixie-arm64-lite.img
+
+      - name: Expand image by 4 GB
+        run: |
+          sudo fallocate -l +4G 2025-10-01-raspios-trixie-arm64-lite.img
+
+      - name: Mount image and resize filesystem
+        run: |
+          LOOP=$(sudo losetup --find --show --partscan \
+              2025-10-01-raspios-trixie-arm64-lite.img)
+          echo "LOOP=$LOOP" >> $GITHUB_ENV
+          sudo parted -s "$LOOP" resizepart 2 100%
+          sudo e2fsck -f -y "${LOOP}p2" || true
+          sudo resize2fs "${LOOP}p2"
+
+      - name: Mount root and boot filesystems
+        run: |
+          sudo mkdir -p /mnt/pi
+          sudo mount "${LOOP}p2" /mnt/pi
+          sudo mount "${LOOP}p1" /mnt/pi/boot/firmware
+
+      - name: Define build variables
+        run: |
+          echo "APP_SCRIPT=eFinder_tetra3rs_mp.py"   >> $GITHUB_ENV
+          echo "EF_UID=1000"                          >> $GITHUB_ENV
+          echo "EF_GID=1000"                          >> $GITHUB_ENV
+          echo "ROOT=/mnt/pi"                         >> $GITHUB_ENV
+
+      - name: Base configuration (outside chroot)
+        env:
+          WIFI_PASSWORD: ${{ github.event.inputs.wifi_password || '12345678' }}
+          WIFI_COUNTRY:  ${{ github.event.inputs.wifi_country  || 'US' }}
+        run: |
+          # Directories
+          sudo mkdir -p $ROOT/home/efinder/Solver
+          sudo mkdir -p $ROOT/home/efinder/Solver/images
+          sudo mkdir -p $ROOT/home/efinder/uploads
+          sudo mkdir -p $ROOT/home/efinder/tetra3rs-src
+          sudo mkdir -p $ROOT/etc/NetworkManager/system-connections
+
+          # -----------------------------------------------------------------------
+          # tetra3 database
+          # -----------------------------------------------------------------------
+          wget -q --show-progress \
+              https://github.com/ssmichael1/tetra3rs/releases/download/latest/hip_main.h5 \
+              -O /tmp/hip_main.h5
+          sudo cp /tmp/hip_main.h5 $ROOT/home/efinder/Solver/
+
+          # -----------------------------------------------------------------------
+          # NetworkManager AP profile
+          # -----------------------------------------------------------------------
+          NM=$ROOT/etc/NetworkManager/system-connections/efinder-ap.nmconnection
+          sudo tee "$NM" > /dev/null << 'NMEOF'
+[connection]
+id=efinder-ap
+uuid=12345678-1234-1234-1234-123456789abc
+type=wifi
+autoconnect=true
+autoconnect-priority=100
+autoconnect-retries=-1
+
+[wifi]
+mode=ap
+ssid=eFinder
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=12345678
+
+[ipv4]
+method=shared
+address1=192.168.50.1/24
+
+[ipv6]
+method=ignore
+NMEOF
+          sudo chmod 600 "$NM"
+
+          # -----------------------------------------------------------------------
+          # /boot/firmware/firstrun.sh
+          # -----------------------------------------------------------------------
+          FBSCRIPT=$ROOT/boot/firmware/firstrun.sh
+          echo "#!/bin/bash"                                                                        | sudo tee    "$FBSCRIPT" > /dev/null
+          echo "set -e"                                                                             | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "CURRENT_HOSTNAME=\$(cat /etc/hostname | tr -d ' \\t\\n\\r')"                      | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_hostname efinder"              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    echo efinder > /etc/hostname"                                                  | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    sed -i \"s/127.0.1.1.*\$CURRENT_HOSTNAME/127.0.1.1\\tefinder/g\" /etc/hosts"  | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "FIRSTUSER=\$(getent passwd 1000 | cut -d: -f1)"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "FIRSTUSERHOME=\$(getent passwd 1000 | cut -d: -f6)"                               | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh"                        | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    systemctl enable ssh"                                                         | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_wlan \"$WIFI_PASSWORD\" \"\" \"$WIFI_COUNTRY\"" | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    NM=/etc/NetworkManager/system-connections/efinder-ap.nmconnection"         | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    nmcli connection load \"\$NM\" 2>/dev/null || true"                        | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    nmcli connection up efinder-ap 2>/dev/null || true"                        | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_timezone America/New_York"     | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    rm -f /etc/localtime"                                                         | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    echo \"America/New_York\" > /etc/timezone"                                    | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    dpkg-reconfigure -f noninteractive tzdata"                                    | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_locale en_US.UTF-8"            | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "SUDO_USER=\$FIRSTUSER"                                                            | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ \"\$FIRSTUSER\" != \"efinder\" ]; then"                                      | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    usermod -l efinder \"\$FIRSTUSER\""                                          | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    usermod -m -d /home/efinder efinder"                                          | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    groupmod -n efinder \"\$FIRSTUSER\""                                         | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    SUDO_USER=efinder"                                                            | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_password \"efinder\" \"\$(/usr/bin/openssl passwd -5 12345678)\"" | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    echo \"efinder:\$(openssl passwd -5 '12345678')\" | chpasswd -e"               | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "# Samba"                                                                           | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "(echo '12345678'; echo '12345678') | smbpasswd -s -a efinder"                      | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "# Disable firstrun.service itself"                                                 | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "systemctl disable firstrun.service"                                               | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "rm -f /boot/firmware/firstrun.sh"                                                  | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "rm -f /etc/systemd/system/firstrun.service"                                        | sudo tee -a "$FBSCRIPT" > /dev/null
+          sudo chmod 755 "$FBSCRIPT"
+
+          # -----------------------------------------------------------------------
+          # /etc/systemd/system/firstrun.service
+          # -----------------------------------------------------------------------
+          FBSVC=$ROOT/etc/systemd/system/firstrun.service
+          sudo tee "$FBSVC" > /dev/null << 'SVCEOF'
+[Unit]
+Description=Configure system on first boot
+ConditionFileIsExecutable=/boot/firmware/firstrun.sh
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/boot/firmware/firstrun.sh
+ExecStartPost=/bin/systemctl --no-reload disable %n
+StandardOutput=journal+console
+
+[Install]
+RequiredBy=sysinit.target
+SVCEOF
+
+          # -----------------------------------------------------------------------
+          # Solver scripts, web UI, and config
+          # -----------------------------------------------------------------------
+          sudo cp -r Solver/. $ROOT/home/efinder/Solver/
+
+          # Stage web UI
+          sudo mkdir -p $ROOT/home/efinder/webui
+          sudo cp -r webui/. $ROOT/home/efinder/webui/
+
+          # Stage the source-compiled tetra3rs wheel
+          sudo cp /tmp/tetra3rs-wheels/*.whl $ROOT/home/efinder/tetra3rs-src/
+          echo "  tetra3rs wheel staged: $(ls /tmp/tetra3rs-wheels/*.whl)"
+
+          # Stage the LAN connection helper
+          [ -f station.sh ] && sudo install -m 755 station.sh \
+              $ROOT/home/efinder/station.sh
+          [ -f sendcmd.sh ] && sudo install -m 755 sendcmd.sh \
+              $ROOT/home/efinder/sendcmd.sh
+
+          # Install efinder-ctl management script
+          [ -f scripts/efinder-ctl ] && sudo install -m 755 scripts/efinder-ctl \
+              $ROOT/usr/local/bin/efinder-ctl
+
+          # Fix ownership before chroot
+          sudo chown -R ${EF_UID}:${EF_GID} $ROOT/home/efinder
+
+          echo "Base configuration complete"
+          echo "LOOP=$LOOP" >> $GITHUB_ENV
 
       # -----------------------------------------------------------------------
       # Base image: Raspberry Pi OS Lite (64-bit) Trixie, 2025-10-01
       # Python 3.13 is system python — matches the wheel built above.
       # -----------------------------------------------------------------------
-      - name: Download official Raspberry Pi OS Lite (Trixie)
+      - name: Set up QEMU for aarch64 chroot
         run: |
-          wget -q \
-            https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2025-10-02/2025-10-01-raspios-trixie-arm64-lite.img.xz
-          xz -d 2025-10-01-raspios-trixie-arm64-lite.img.xz
+          sudo update-binfmts --enable qemu-aarch64
+          sudo cp /usr/bin/qemu-aarch64-static /mnt/pi/usr/bin/
+          sudo mount --bind /dev       /mnt/pi/dev
+          sudo mount --bind /dev/pts   /mnt/pi/dev/pts
+          sudo mount --bind /proc      /mnt/pi/proc
+          sudo mount --bind /sys       /mnt/pi/sys
+          echo '#!/bin/sh\nexit 101' | sudo tee /mnt/pi/usr/sbin/policy-rc.d > /dev/null
+          sudo chmod +x /mnt/pi/usr/sbin/policy-rc.d
+
+      - name: Install packages and configure system in chroot
+        run: |
+          sudo chroot /mnt/pi /bin/bash -c "
+            apt-get update -q
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \\
+                python3-pip \\
+                python3-venv \\
+                python3-picamera2 \\
+                python3-numpy \\
+                i2c-tools \\
+                libi2c-dev \\
+                python3-smbus \\
+                libcamera-apps \\
+                apache2 \\
+                php \\
+                libapache2-mod-php \\
+                samba \\
+                samba-common-bin \\
+                zram-tools
+          "
+
+      - name: Set up Python virtual environment in chroot
+        run: |
+          sudo chroot /mnt/pi /bin/bash -c "
+            python3 -m venv --system-site-packages /home/efinder/venv-efinder
+            /home/efinder/venv-efinder/bin/pip install --upgrade pip
+            /home/efinder/venv-efinder/bin/pip install \\
+                smbus2 \\
+                adafruit-circuitpython-bno055 \\
+                flask \\
+                scipy \\
+                pillow
+          "
+
+      - name: Install tetra3rs wheel in chroot
+        run: |
+          WHEEL=$(ls /mnt/pi/home/efinder/tetra3rs-src/*.whl | head -1)
+          sudo chroot /mnt/pi /bin/bash -c "
+            /home/efinder/venv-efinder/bin/pip install /home/efinder/tetra3rs-src/$(basename $WHEEL)
+          "
 
       - name: Mount image and apply base configuration
         run: |
@@ -164,13 +402,13 @@ jobs:
           echo "  efinder user created (UID=$EF_UID)"
 
           # ------------------------------------------------------------------
-          # Hostname
+          # ap.sh helper
           # ------------------------------------------------------------------
           echo "efinder" | sudo tee $ROOT/etc/hostname > /dev/null
           sudo sed -i 's/raspberrypi/efinder/g' $ROOT/etc/hosts
 
           # ------------------------------------------------------------------
-          # SSH
+          # efinder-ensure-ap.sh
           # ------------------------------------------------------------------
           sudo touch $ROOT/boot/firmware/ssh
           sudo sed -i \

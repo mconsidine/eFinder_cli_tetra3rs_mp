@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}eFinder Status{% endblock %}
+{% block content %}
+
+{% if not status_ok %}
+  <div class="alert alert-error">
+    <strong>Daemon not reachable:</strong> {{ status_error }}
+  </div>
+{% else %}
+
+<section class="grid">
+  <div class="card">
+    <h2>Camera</h2>
+    <p class="hint">Live view, exposure, gain, and solver parameters.</p>
+    <a href="{{ url_for('camera_page') }}" class="btn" style="display:inline-block;margin-top:4px;">Open Camera &rarr;</a>
+  </div>
+
+  <div class="card" id="solution-card">
+    <h2>Pointing</h2>
+    {% if solution and solution.solved %}
+      <div class="big-coords">
+        <div><span class="label">RA</span> <span id="ra">{{ solution.ra_str }}</span></div>
+        <div><span class="label">Dec</span> <span id="dec">{{ solution.dec_str }}</span></div>
+      </div>
+      <dl class="stats">
+        <dt>Stars</dt><dd id="stars">{{ solution.stars }}</dd>
+        <dt>Matches</dt><dd id="matches">{{ solution.matches }}</dd>
+        <dt>Solve time</dt><dd id="solve_ms">{{ "%.0f"|format(solution.solve_ms) }} ms</dd>
+        <dt>Peak</dt><dd id="peak">{{ solution.peak }}</dd>
+        <dt>FOV</dt><dd id="fov">{{ "%.3f"|format(solution.fov_deg) }}&deg;</dd>
+        <dt>Roll</dt><dd id="roll">{{ "%.1f"|format(solution.roll_deg) }}&deg;</dd>
+      </dl>
+    {% else %}
+      <div class="not-solved" id="not-solved">
+        <div>No solve yet</div>
+        <dl class="stats">
+          <dt>Stars detected</dt><dd id="stars">{{ solution.stars if solution else 0 }}</dd>
+          <dt>Peak</dt><dd id="peak">{{ solution.peak if solution else 0 }}</dd>
+          <dt>Status</dt><dd id="status">{{ solution.status if solution else 0 }}{% if solution %} ({{ {0:"waiting",3:"timeout",5:"too few stars"}.get(solution.status, "unknown") }}){% endif %}</dd>
+        </dl>
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Focus</h2>
+    {% if committed_focus is not none %}
+      <div class="focus-score-sm">{{ "%.1f"|format(committed_focus) }}</div>
+      <p class="hint">Score at last focus set. <a href="{{ url_for('focus_page') }}">Refocus &rarr;</a></p>
+    {% else %}
+      <p class="muted">Not set. <a href="{{ url_for('focus_page') }}" style="color:#ff5500;">Focus &rarr;</a></p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Calibration</h2>
+    {% if calibration %}
+      <dl class="stats">
+        <dt>State</dt><dd>{{ calibration.state }}</dd>
+        <dt>Committed FOV</dt>
+        <dd>{{ "%.4f"|format(calibration.committed_fov)|safe if calibration.committed_fov else "(not yet)" }} &deg;</dd>
+        <dt>Window</dt>
+        <dd>{{ calibration.window_filled }} / {{ calibration.window_size }}</dd>
+      </dl>
+      <form method="post" action="{{ url_for('calibration_reset') }}"
+            onsubmit="return confirm('Reset FOV calibration? You\'ll lose the converged value and the next solves will recalibrate.');">
+        <button type="submit" class="btn btn-warning">Recalibrate</button>
+      </form>
+    {% else %}
+      <p class="muted">{{ cal_error or "no data" }}</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Boresight</h2>
+    {% if boresight %}
+      <dl class="stats">
+        <dt>X (pixels)</dt><dd>{{ "%.1f"|format(boresight.x) }}</dd>
+        <dt>Y (pixels)</dt><dd>{{ "%.1f"|format(boresight.y) }}</dd>
+      </dl>
+    {% endif %}
+    <form method="post" action="{{ url_for('boresight_center') }}">
+      <button type="submit" class="btn">Reset to center</button>
+    </form>
+    <p class="hint">Use SkySafari "Align" on a known star for normal alignment.</p>
+  </div>
+
+  <div class="card" id="imu-card">
+    <h2>IMU</h2>
+    {% if imu and imu.available %}
+      {% if imu.active %}
+        <p style="color:#ff5500; font-weight:500;">Active &mdash; smoothing SkySafari updates</p>
+      {% else %}
+        <p class="hint">Detected &mdash; calibrating&hellip;</p>
+      {% endif %}
+      <dl class="stats">
+        <dt>Solves</dt>
+        <dd id="imu-n">{{ imu.calib_n }} / 3</dd>
+        <dt>R&sup2;</dt>
+        <dd id="imu-quality">{{ "%.2f"|format(imu.quality) }}</dd>
+        <dt>State</dt>
+        <dd id="imu-state">{{ "active" if imu.active else "calibrating" }}</dd>
+      </dl>
+    {% else %}
+      <p class="muted" id="imu-state">Not detected</p>
+      <p class="hint">
+        Wire a BNO055 to I&sup2;C (GPIO&nbsp;2/3) for smoothed pointing
+        between plate-solves.  Activates automatically when detected.
+      </p>
+    {% endif %}
+  </div>
+</section>
+
+<script>
+async function refresh() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.status.ok) return;
+    const sol = data.status.result.solution;
+    if (sol.solved) {
+      const raH = sol.ra_deg / 15;
+      document.getElementById('ra').textContent = formatHMS(raH);
+      document.getElementById('dec').textContent = formatDMS(sol.dec_deg);
+      document.getElementById('stars').textContent = sol.stars;
+      const m = document.getElementById('matches');
+      if (m) m.textContent = sol.matches;
+      const sms = document.getElementById('solve_ms');
+      if (sms) sms.textContent = sol.solve_ms.toFixed(0) + ' ms';
+      const peak = document.getElementById('peak');
+      if (peak) peak.textContent = sol.peak;
+      const fov = document.getElementById('fov');
+      if (fov) fov.textContent = sol.fov_deg.toFixed(3) + '°';
+      const roll = document.getElementById('roll');
+      if (roll) roll.textContent = (sol.roll_deg || 0).toFixed(1) + '°';
+    } else {
+      const ns = document.getElementById('not-solved');
+      if (ns) {
+        document.getElementById('stars').textContent = sol.stars || 0;
+        document.getElementById('peak').textContent = sol.peak || 0;
+        const status = document.getElementById('status');
+        if (status) {
+          const labels = {0:"waiting",3:"timeout",5:"too few stars"};
+          const s = sol.status || 0;
+          status.textContent = s + ' (' + (labels[s] || 'unknown') + ')';
+        }
+      }
+    }
+    const imu = data.status.result.imu;
+    if (imu) {
+      const nEl = document.getElementById('imu-n');
+      const qEl = document.getElementById('imu-quality');
+      const sEl = document.getElementById('imu-state');
+      if (nEl) nEl.textContent = imu.calib_n + ' / 3';
+      if (qEl) qEl.textContent = imu.quality.toFixed(2);
+      if (sEl) sEl.textContent = !imu.available ? 'Not detected'
+                                : imu.active     ? 'active'
+                                :                  'calibrating';
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+function formatHMS(h) {
+  h = ((h % 24) + 24) % 24;
+  const H = Math.floor(h);
+  const m = (h - H) * 60;
+  const M = Math.floor(m);
+  const S = Math.round((m - M) * 60);
+  return `${String(H).padStart(2,'0')}h${String(M).padStart(2,'0')}m${String(S).padStart(2,'0')}s`;
+}
+function formatDMS(d) {
+  const sign = d >= 0 ? '+' : '-';
+  const a = Math.abs(d);
+  const D = Math.floor(a);
+  const m = (a - D) * 60;
+  const M = Math.floor(m);
+  const S = Math.round((m - M) * 60);
+  return `${sign}${String(D).padStart(2,'0')}°${String(M).padStart(2,'0')}'${String(S).padStart(2,'0')}"`;
+}
+setInterval(refresh, 1500);
+</script>
+
+{% endif %}
+{% endblock %}

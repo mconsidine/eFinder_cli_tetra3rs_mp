@@ -1,0 +1,71 @@
+{% if polar.state == 'idle' %}
+  <h3>Ready</h3>
+  <p>Press <em>Start polar alignment</em> below when you've roughly polar-aligned
+     your mount and have an open patch of sky.</p>
+
+{% elif polar.state == 'waiting_for_dwell' %}
+  <h3>Hold mount stationary</h3>
+  <p class="instruction" id="needed-action">{{ polar.needed_action }}</p>
+  <p>Points captured: <span id="points-captured">{{ polar.points_captured }}</span> /
+     {{ polar.target_points }}</p>
+  <p class="muted">Elapsed: <span id="elapsed">{{ "%.0f"|format(polar.elapsed_s) }} s</span></p>
+
+{% elif polar.state == 'waiting_for_slew' %}
+  <h3>Rotate the mount in RA</h3>
+  <p class="instruction" id="needed-action">{{ polar.needed_action }}</p>
+  <p>Rotate the mount about its RA axis only -- don't change altitude or azimuth.
+     Stop when you've moved roughly 30 degrees, then hold steady.</p>
+  <p>Points captured: <span id="points-captured">{{ polar.points_captured }}</span> /
+     {{ polar.target_points }}</p>
+  <p class="muted">Elapsed: <span id="elapsed">{{ "%.0f"|format(polar.elapsed_s) }} s</span></p>
+
+{% elif polar.state == 'done' %}
+  <h3>Result</h3>
+  {% set r = polar.last_result %}
+  {% if r %}
+    {% if r.needs_latitude %}
+      <p class="alert alert-warning">{{ r.message }}</p>
+      <dl class="stats">
+        <dt>Total error (from pole)</dt>
+        <dd>{{ "%.2f"|format(r.total_error_arcmin) }} arcmin</dd>
+        <dt>Apparent RA axis</dt>
+        <dd>RA {{ "%.4f"|format(r.axis_ra_deg) }}, Dec {{ "%.4f"|format(r.axis_dec_deg) }}</dd>
+      </dl>
+    {% else %}
+      <div class="big-coords">
+        <div><span class="label">Total</span>
+          <span>{{ "%.1f"|format(r.total_error_arcmin) }}'</span>
+        </div>
+        <div><span class="label">Az</span>
+          <span>{{ "%+.1f"|format(r.azimuth_error_arcmin) }}'</span>
+        </div>
+        <div><span class="label">Alt</span>
+          <span>{{ "%+.1f"|format(r.altitude_error_arcmin) }}'</span>
+        </div>
+      </div>
+      <dl class="stats">
+        <dt>Plane fit RMS</dt>
+        <dd>{{ "%.2f"|format(r.plane_fit_rms_arcmin) }} arcmin
+          {% if r.plane_fit_rms_arcmin > 1.0 %}
+            <span class="alert-inline">(high; check that you rotated in RA only)</span>
+          {% endif %}
+        </dd>
+        <dt>Apparent RA axis</dt>
+        <dd>RA {{ "%.4f"|format(r.axis_ra_deg) }}, Dec {{ "%.4f"|format(r.axis_dec_deg) }}</dd>
+        <dt>Points used</dt>
+        <dd>{{ r.n_points }}</dd>
+      </dl>
+      <p class="hint">
+        Adjust the mount's azimuth knob to reduce <strong>Az</strong> toward 0,
+        and the altitude knob to reduce <strong>Alt</strong>. Re-run alignment
+        to verify.
+      </p>
+    {% endif %}
+  {% else %}
+    <p>(no result available)</p>
+  {% endif %}
+
+{% elif polar.state == 'error' %}
+  <h3 class="alert">Error</h3>
+  <p>{{ polar.error_message }}</p>
+{% endif %}

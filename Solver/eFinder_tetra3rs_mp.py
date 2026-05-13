@@ -26,7 +26,7 @@
 #   test_mode      — Value(c_bool)   lx200 sets, camera reads
 #   cmd_q          — Queue  lx200 -> solver: tuning/on-demand commands
 #   result_q       — Queue  solver -> lx200: command results
-#   cam_cmd_q      — Queue  solver -> camera: set_exp, capture_once
+#   cam_cmd_q      — Queue  solver -> camera: set_exp, captur
 #   cam_result_q   — Queue  camera -> solver: captured frames
 #
 # /dev/shm/efinder_state.json  written by solver after each solve — slow
@@ -43,6 +43,7 @@ import time
 import csv
 import json
 import ctypes
+import collections
 from datetime import datetime
 from pathlib import Path
 from multiprocessing import (
@@ -76,10 +77,7 @@ LIVE_IMAGE = '/dev/shm/efinder_live.jpg'
 CENTRE_X = FRAME_W / 2.0
 CENTRE_Y = FRAME_H / 2.0
 
-# Triple-buffered camera -> solver frame handoff (items 1 + 3).
-# Three SharedMemory slots; camera rotates writes across the two slots
-# that the solver isn't currently reading. latest_slot and frame_seq are
-# published atomically as the final step of each write.
+# Triple-buffered camera -> solver frame handoff.
 N_FRAME_SLOTS = 3
 
 # ---------------------------------------------------------------------------
@@ -160,45 +158,28 @@ class Coordinates:
 
 # ---------------------------------------------------------------------------
 # Offset / pixel conversion (tetra3rs centred convention)
-# d_x / d_y stored in eFinder.config in arcminutes on sky.
 # ---------------------------------------------------------------------------
 def dxdy2centred(dx_deg, dy_deg):
-    """Convert angular offset (degrees) to centred pixel coords."""
-    cx =  dx_deg * 3600 / CAM_ARCSEC_PX      # +X right
-    cy = -dy_deg * 3600 / CAM_ARCSEC_PX      # +Y down (dy up = negative cy)
+    cx =  dx_deg * 3600 / CAM_ARCSEC_PX
+    cy = -dy_deg * 3600 / CAM_ARCSEC_PX
     return cx, cy
 
 def centred2dxdy(cx, cy):
-    """Convert centred pixel coords to angular offset (degrees)."""
     dx_deg =  cx * CAM_ARCSEC_PX / 3600
     dy_deg = -cy * CAM_ARCSEC_PX / 3600
     return dx_deg, dy_deg
 
 # ---------------------------------------------------------------------------
-# CPU affinity helper (item 5)
+# CPU affinity helper
 # ---------------------------------------------------------------------------
-# The Pi Zero 2W has 4x Cortex-A53. We pin each worker to specific cores
-# to keep the solver's hot numeric loop from being interrupted by camera
-# DMA completion handling or by SkySafari socket traffic, and to give the
-# solver's two background threads (state writer, live JPEG renderer) room
-# to run without stealing cycles from the main solve loop.
-#
-# Mapping (see CPU_PINNING dict). Tuneable if field measurements suggest
-# a different assignment works better.
-#
-# sched_setaffinity can fail on restricted kernels, inside containers, or
-# when systemd CPUAffinity= is already set; we log and carry on. Losing
-# the tuning doesn't break correctness.
-
 CPU_PINNING = {
-    'main':   {0},      # supervisor — idle most of the time
-    'camera': {0},      # light work, shares with USB/SDIO IRQs
-    'lx200':  {1},      # isolated from solver so replies never queue
-    'solver': {2, 3},   # heavy: main loop + state thread + live-jpeg thread
+    'main':   {0},
+    'camera': {0},
+    'lx200':  {1},
+    'solver': {2, 3},
 }
 
 def _pin_cpu(label):
-    """Best-effort CPU affinity pin. Logs result, never raises."""
     cores = CPU_PINNING.get(label)
     if not cores:
         return
@@ -224,21 +205,6 @@ def _pin_cpu(label):
 # ===========================================================================
 def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                    test_mode, latest_slot, frame_seq):
-    """
-    Owns Picamera2. Rotates writes across three SharedMemory slots so the
-    solver can read the most-recently-published slot without racing the
-    writer. Publishes (latest_slot, frame_seq) atomically after each write.
-
-    shm_names   : list of 3 SharedMemory names (created by main)
-    frame_ready : Event — set after each completed publish
-    latest_slot : Value(c_int)  — index (0/1/2) of last fully-written slot
-    frame_seq   : Value(c_uint64) — monotonic frame counter
-
-    Commands on cam_cmd_q:
-        ('set_exp', exposure, gain)
-        ('capture_once', None, None)  -> puts ('frame', array) on cam_result_q
-        ('stop', None, None)
-    """
     _pin_cpu('camera')
     from picamera2 import Picamera2
 
@@ -319,21 +285,16 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                    lx200_cmd_q, lx200_result_q,
                    shared_ra, shared_dec, offset_flag, test_mode,
                    latest_slot, frame_seq):
-    """
-    Owns tetra3rs database.
-    Continuous loop: wait for frame -> solve -> update shared_ra/shared_dec.
-    Also handles on-demand commands from lx200_cmd_q.
-
-    Reads frames from one of three SHM slots; `latest_slot` tells which
-    slot is current, `frame_seq` is the monotonic frame number. We track
-    `last_solved_seq` so we never redundantly solve the same frame.
-    """
     _pin_cpu('solver')
     import tetra3rs
     import serial as _pyserial
     from threading import Thread as _Thread, Lock as _Lock
     from queue import Queue as _ThreadQueue, Empty as _QueueEmpty, Full as _QueueFull
     from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageOps
+
+    # Ensure Solver/ is on sys.path so polar_run/polar/maint are importable
+    if solver_path not in sys.path:
+        sys.path.insert(0, solver_path)
 
     param = load_param()
     coordinates = Coordinates()
@@ -460,20 +421,36 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         return _vec_to_radec(v1)
 
     # --- FOV calibration ---
-    _fov_samples  = []
-    _FOV_MIN, _FOV_MAX = 5, 20
+    _FOV_MIN, _FOV_MAX = 5, 30
+    _fov_samples  = collections.deque(maxlen=_FOV_MAX)
     _fov_measured = float(param.get('fov_measured', '0'))
+    _calibrator   = None
+    try:
+        from calibration import FovCalibrator as _FovCalibrator
+        _calibrator = _FovCalibrator(param, save_param, CAM_FOV_DEG, FRAME_W)
+        print('[solver] calibrator: state=%s fov=%.4f max_err=%.2f' % (
+            _calibrator.state.value, _calibrator.get_fov_estimate(),
+            _calibrator.get_fov_max_error()))
+    except Exception as _cal_e:
+        print('[solver] FovCalibrator not available:', _cal_e)
 
     def _get_fov():
-        if _fov_measured > 0 and len(_fov_samples) >= _FOV_MIN:
+        if _calibrator:
+            return _calibrator.get_fov_estimate(), _calibrator.get_fov_max_error()
+        if _fov_measured > 0:
             return _fov_measured, 0.3
         return CAM_FOV_DEG, 1.0
 
     def _update_fov(fov_deg):
         nonlocal _fov_measured
-        if not fov_deg or fov_deg <= 0: return
+        if not fov_deg or fov_deg <= 0:
+            return
+        if _calibrator:
+            _calibrator.update_from_solve(fov_deg)
+            if _calibrator.committed_fov:
+                _fov_measured = _calibrator.committed_fov
+            return
         _fov_samples.append(fov_deg)
-        if len(_fov_samples) > _FOV_MAX: _fov_samples.pop(0)
         if len(_fov_samples) < _FOV_MIN: return
         avg = sum(_fov_samples) / len(_fov_samples)
         if abs(avg - _fov_measured) > 0.05:
@@ -581,8 +558,21 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             'fov_measured':    round(_fov_measured, 3) if _fov_measured > 0 else None,
             'fov_samples':     len(_fov_samples),
             'offset_str':      offset_str,
+            'offset_cx':       offset_cx,
+            'offset_cy':       offset_cy,
             'cpu_temp':        round(cpu_temp, 1),
             'memory_usage':    memory_mb,
+            'calibration': (_calibrator.get_status() if _calibrator else {
+                'state': 'calibrated' if _fov_measured > 0 else 'calibrating',
+                'committed_fov': round(_fov_measured, 4) if _fov_measured > 0 else None,
+                'window_filled': len(_fov_samples),
+                'window_size': _FOV_MAX,
+            }),
+            'polar': (_polar_aligner.get_status() if _polar_aligner else {
+                'state': 'idle', 'points_captured': 0, 'target_points': 3,
+                'latitude_deg': None, 'needed_action': '', 'elapsed_s': 0.0,
+                'error_message': '', 'last_result': None,
+            }),
         }
         with _state_lock:
             _state_snapshot.clear()
@@ -675,7 +665,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     def _do_solve(img):
         nonlocal solve, solved_radec, solution, firstCentroid, centroids_last
-        nonlocal stars, peak, eTime
+        nonlocal stars, peak, eTime, _sol_camera_model, _last_solve_time
 
         t0 = time.time()
         np_img = img if img.dtype == np.uint8 else img.astype(np.uint8)
@@ -690,7 +680,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         extraction = tetra3rs.extract_centroids(
             np_img,
-            sigma_threshold=10.0,
+            sigma_threshold=_detect_sigma,
             max_centroids=MAX_CENTROIDS,
         )
         centroid_list = extraction.centroids
@@ -716,7 +706,13 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             image_shape       = (FRAME_H, FRAME_W),
             solve_timeout_ms  = BLIND_TIMEOUT_MS,
         )
-        if solve and solution is not None:
+        if (_sol_camera_model is not None and _calibrator and
+                _calibrator.state.value == 'calibrated'):
+            try:
+                kwargs['camera_model'] = _sol_camera_model
+            except Exception:
+                pass
+        if solve and solution is not None and (time.time() - _last_solve_time) <= _HINT_MAX_AGE_S:
             try:
                 kwargs['attitude_hint']        = solution.quaternion
                 kwargs['hint_uncertainty_deg'] = 1.0
@@ -873,7 +869,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     def _handle(cmd, a, b):
         nonlocal solve, solved_radec, offset_cx, offset_cy, offset_str
-        nonlocal keep, frame_n
+        nonlocal keep, frame_n, _fov_measured, _detect_sigma
 
         if cmd == 'adj_exp':
             new_exp = '%.1f' % max(0.1, float(param.get('Exposure','0.2'))
@@ -891,6 +887,11 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         elif cmd == 'set_exp':
             _set_camera(float(a), param.get('Gain','20')); return '1'
+
+        elif cmd == 'set_gain':
+            g = max(1, min(64, float(a) if a is not None else 20))
+            _set_camera(param.get('Exposure', '0.2'), '%.1f' % g)
+            return '%.1f' % g
 
         elif cmd == 'auto_exp':
             exp = float(param.get('Exposure','0.2'))
@@ -954,6 +955,17 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             offset_str = '%1.3f,%1.3f' % (0.0, 0.0)
             save_param(param); _write_state(); return '1'
 
+        elif cmd == 'boresight_set':
+            px_y = float(a) if a is not None else CENTRE_Y
+            px_x = float(b) if b is not None else CENTRE_X
+            offset_cx = px_x - CENTRE_X
+            offset_cy = px_y - CENTRE_Y
+            dx_deg, dy_deg = centred2dxdy(offset_cx, offset_cy)
+            param['d_x'] = '{:.2f}'.format(60 * dx_deg)
+            param['d_y'] = '{:.2f}'.format(60 * dy_deg)
+            offset_str = '%1.3f,%1.3f' % (dx_deg, dy_deg)
+            save_param(param); _write_state(); return '1'
+
         elif cmd == 'start_images':
             keep = (a == '1'); frame_n = 0 if keep else frame_n
             print('[solver] image saving:', 'on' if keep else 'off')
@@ -961,6 +973,70 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         elif cmd == 'date_set':
             coordinates.dateSet(*a); return '1'
+
+        elif cmd == 'calibration_reset':
+            if _calibrator:
+                _calibrator.force_recalibrate()
+                _fov_measured = 0.0
+            else:
+                _fov_samples.clear()
+                _fov_measured = 0.0
+                param['fov_measured'] = '0'
+                save_param(param)
+            _snapshot_state()
+            return 'ok'
+
+        elif cmd == 'polar_start':
+            if _polar_aligner: _polar_aligner.start()
+            _snapshot_state()
+            return 'ok'
+
+        elif cmd == 'polar_cancel':
+            if _polar_aligner: _polar_aligner.cancel()
+            _snapshot_state()
+            return 'ok'
+
+        elif cmd == 'polar_set_latitude':
+            lat = float(a) if a is not None else 0.0
+            persist = b if b is not None else True
+            if _polar_aligner:
+                _polar_aligner.set_latitude(lat)
+            if persist:
+                param['latitude'] = '%.6f' % lat
+                save_param(param)
+            _snapshot_state()
+            return 'ok'
+
+        elif cmd == 'boresight_align':
+            target_ra_deg  = float(a) if a is not None else 0.0
+            target_dec_deg = float(b) if b is not None else 0.0
+            offset_flag.value = True
+            ok = _do_solve(_request_capture())
+            if not ok:
+                offset_flag.value = False
+                return 'fail'
+            try:
+                pix = solution.world_to_pixel(target_ra_deg, target_dec_deg)
+            except Exception:
+                pix = None
+            if pix is None:
+                offset_flag.value = False
+                return 'fail'
+            px_x, px_y = pix
+            offset_cx = px_x
+            offset_cy = px_y
+            dx_deg, dy_deg = centred2dxdy(px_x, px_y)
+            param['d_x'] = '{:.2f}'.format(60 * dx_deg)
+            param['d_y'] = '{:.2f}'.format(60 * dy_deg)
+            offset_str = '%1.3f,%1.3f' % (dx_deg, dy_deg)
+            save_param(param)
+            offset_flag.value = False
+            _write_state()
+            return '1'
+
+        elif cmd == 'set_sigma':
+            _detect_sigma = max(3.0, min(30.0, float(a) if a is not None else 10.0))
+            return '%.1f' % _detect_sigma
 
         return 'ok'
 
@@ -1014,18 +1090,23 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             print('[solver] ****************')
 
 # ===========================================================================
-# PROCESS 3 - LX200 / WiFi server
+# PROCESS 3 - LX200 / WiFi server + maintenance socket
 # ===========================================================================
 def lx200_process(lx200_cmd_q, lx200_result_q,
                   shared_ra, shared_dec, offset_flag, test_mode):
-    """
-    Serves SkySafari on port 4060.
-    Reads ra/dec directly from shared Values - no IPC latency on hot path.
-    Reads other telemetry from /dev/shm/efinder_state.json (non-critical path).
-    Sends tuning/on-demand commands to solver via lx200_cmd_q.
-    """
     _pin_cpu('lx200')
+    import threading as _threading
+    import socket as _socket_mod
+
+    # Ensure Solver/ is on sys.path so maint/polar_run are importable
+    if solver_path not in sys.path:
+        sys.path.insert(0, solver_path)
+
     coordinates = Coordinates()
+
+    # Serialises both LX200 blocking commands and maint socket mutations
+    # so only one consumer is using the solver queue at a time.
+    _solver_lock = _threading.Lock()
 
     def _read_state(key, default=''):
         try:
@@ -1034,14 +1115,240 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
         except Exception:
             return default
 
-    def _cmd(cmd, a=None, b=None, timeout=15.0):
-        lx200_cmd_q.put((cmd, a, b))
+    def _read_state_json():
         try:
-            _, result = lx200_result_q.get(timeout=timeout)
-            return str(result)
+            with open(STATE_FILE) as f:
+                return json.load(f)
         except Exception:
-            return 'err'
+            return {}
 
+    def _cmd(cmd, a=None, b=None, timeout=15.0):
+        with _solver_lock:
+            lx200_cmd_q.put((cmd, a, b))
+            try:
+                _, result = lx200_result_q.get(timeout=timeout)
+                return str(result)
+            except Exception:
+                return 'err'
+
+    # ------------------------------------------------------------------
+    # Maintenance socket server
+    # ------------------------------------------------------------------
+    MAINT_SOCK = os.environ.get('EFINDER_MAINT_SOCKET', '/run/efinder/maint.sock')
+
+    def _handle_maint(req):
+        from maint import MaintResponse
+        cmd  = req.cmd
+        args = req.args or {}
+
+        # --- Read-only: answer directly from STATE_FILE ---
+        if cmd == 'ping':
+            return MaintResponse(ok=True, result='pong')
+
+        elif cmd == 'version':
+            state = _read_state_json()
+            return MaintResponse(ok=True, result={'version': state.get('version', version)})
+
+        elif cmd == 'status':
+            state = _read_state_json()
+            solve_status = state.get('solve_status', 'No solve')
+            ra_hours = float(state.get('ra', 0.0))
+            dec_val  = float(state.get('dec', 0.0))
+            fov_val  = float(state.get('fov_measured') or 0.0) or CAM_FOV_DEG
+            cx = float(state.get('offset_cx', 0.0))
+            cy = float(state.get('offset_cy', 0.0))
+            result = {
+                'solution': {
+                    'solved':    solve_status in ('Solved', 'Estimated'),
+                    'ra_deg':    ra_hours * 15.0,
+                    'dec_deg':   dec_val,
+                    'fov_deg':   fov_val,
+                    'roll_deg':  0.0,
+                    'stars':     int(state.get('stars', '0').strip() or 0),
+                    'matches':   0,
+                    'peak':      int(state.get('peak', '0').strip() or 0),
+                    'solve_ms':  float(state.get('solve_time', '0') or 0) * 1000,
+                    'status':    0,
+                },
+                # Boresight in rotated (live) image: 180-degree rotation means
+                # (cx, cy) in centred coords -> (CENTRE_X - cx, CENTRE_Y - cy)
+                'boresight': {'x': CENTRE_X - cx, 'y': CENTRE_Y - cy},
+                'fov_deg':  fov_val,
+                'imu': {
+                    'available': False,
+                    'calib_n':   0,
+                    'quality':   0.0,
+                    'active':    False,
+                },
+            }
+            return MaintResponse(ok=True, result=result)
+
+        elif cmd == 'calibration_status':
+            state = _read_state_json()
+            cal = state.get('calibration')
+            if cal:
+                return MaintResponse(ok=True, result=cal)
+            fov_measured = float(state.get('fov_measured') or 0.0)
+            fov_samples  = int(state.get('fov_samples', 0) or 0)
+            return MaintResponse(ok=True, result={
+                'state':         'calibrated' if fov_measured > 0 else 'calibrating',
+                'committed_fov': round(fov_measured, 4) if fov_measured > 0 else None,
+                'window_filled': fov_samples,
+                'window_size':   20,
+            })
+
+        elif cmd == 'polar_status':
+            state = _read_state_json()
+            polar = state.get('polar', {
+                'state': 'idle', 'points_captured': 0, 'target_points': 3,
+                'latitude_deg': None, 'needed_action': '', 'elapsed_s': 0.0,
+                'error_message': '', 'last_result': None,
+            })
+            return MaintResponse(ok=True, result=polar)
+
+        elif cmd == 'exposure_get':
+            state = _read_state_json()
+            return MaintResponse(ok=True, result={
+                'exposure_s': float(state.get('exposure', '0.2') or 0.2),
+                'gain':       float(state.get('gain', '20') or 20),
+            })
+
+        elif cmd == 'boresight_show':
+            state = _read_state_json()
+            cx = float(state.get('offset_cx', 0.0))
+            cy = float(state.get('offset_cy', 0.0))
+            return MaintResponse(ok=True, result={
+                'x': CENTRE_X + cx,
+                'y': CENTRE_Y + cy,
+                'offset_cx': cx,
+                'offset_cy': cy,
+            })
+
+        # --- Mutations: route through solver queue, serialise with lock ---
+        else:
+            # Map maint command -> solver queue command + args
+            queue_map = {
+                'reset_offset':       ('reset_offset',       None, None,  10.0),
+                'boresight_center':   ('reset_offset',       None, None,  10.0),
+                'calibration_reset':  ('calibration_reset',  None, None,  10.0),
+                'polar_start':        ('polar_start',        None, None,  5.0),
+                'polar_cancel':       ('polar_cancel',       None, None,  5.0),
+            }
+            if cmd in queue_map:
+                qcmd, qa, qb, qtimeout = queue_map[cmd]
+            elif cmd == 'exposure_set':
+                exp_s = args.get('exposure_s')
+                if exp_s is None:
+                    return MaintResponse(ok=False, error='exposure_s required')
+                qcmd, qa, qb, qtimeout = 'set_exp', float(exp_s), None, 10.0
+            elif cmd == 'gain_set':
+                gain = args.get('gain')
+                if gain is None:
+                    return MaintResponse(ok=False, error='gain required')
+                qcmd, qa, qb, qtimeout = 'set_gain', float(gain), None, 10.0
+            elif cmd == 'boresight_set':
+                y = args.get('y')
+                x = args.get('x')
+                if y is None or x is None:
+                    return MaintResponse(ok=False, error='y and x required')
+                try:
+                    y, x = float(y), float(x)
+                except (ValueError, TypeError):
+                    return MaintResponse(ok=False, error='y and x must be numeric')
+                if not (0 <= y <= FRAME_H) or not (0 <= x <= FRAME_W):
+                    return MaintResponse(ok=False, error='y/x outside frame bounds')
+                qcmd, qa, qb, qtimeout = 'boresight_set', y, x, 10.0
+            elif cmd == 'polar_set_latitude':
+                lat = args.get('latitude_deg')
+                if lat is None:
+                    return MaintResponse(ok=False, error='latitude_deg required')
+                persist = bool(args.get('persist', True))
+                qcmd, qa, qb, qtimeout = 'polar_set_latitude', float(lat), persist, 5.0
+            elif cmd == 'boresight_align':
+                ra_deg  = args.get('ra_deg')
+                dec_deg = args.get('dec_deg')
+                if ra_deg is None or dec_deg is None:
+                    return MaintResponse(ok=False, error='ra_deg and dec_deg required')
+                qcmd, qa, qb, qtimeout = 'boresight_align', float(ra_deg), float(dec_deg), 30.0
+            elif cmd == 'sigma_set':
+                sigma = args.get('sigma')
+                if sigma is None:
+                    return MaintResponse(ok=False, error='sigma required')
+                qcmd, qa, qb, qtimeout = 'set_sigma', float(sigma), None, 5.0
+            else:
+                return MaintResponse(ok=False, error=f'unknown command: {cmd}')
+
+            if not _solver_lock.acquire(timeout=2.0):
+                return MaintResponse(ok=False, error='solver busy (try again)')
+            try:
+                lx200_cmd_q.put((qcmd, qa, qb))
+                try:
+                    _, result = lx200_result_q.get(timeout=qtimeout)
+                except Exception as e:
+                    return MaintResponse(ok=False, error=f'solver timeout: {e}')
+            finally:
+                _solver_lock.release()
+            return MaintResponse(ok=True, result=str(result))
+
+    def _handle_maint_client(conn):
+        from maint import MaintRequest, MaintResponse
+        try:
+            buf = b''
+            while b'\n' not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line, _, _ = buf.partition(b'\n')
+            if not line:
+                return
+            req  = MaintRequest.decode(line)
+            resp = _handle_maint(req)
+            conn.sendall(resp.encode())
+        except Exception as e:
+            try:
+                from maint import MaintResponse
+                conn.sendall(MaintResponse(ok=False, error=str(e)).encode())
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _serve_maint():
+        sock_dir = os.path.dirname(MAINT_SOCK)
+        try:
+            os.makedirs(sock_dir, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            os.unlink(MAINT_SOCK)
+        except OSError:
+            pass
+        srv = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+        srv.bind(MAINT_SOCK)
+        try:
+            os.chmod(MAINT_SOCK, 0o660)
+        except Exception:
+            pass
+        srv.listen(8)
+        print('[lx200] maint socket at', MAINT_SOCK)
+        while True:
+            try:
+                conn, _ = srv.accept()
+                _threading.Thread(target=_handle_maint_client,
+                                  args=(conn,), daemon=True).start()
+            except Exception as e:
+                print('[lx200] maint accept error:', e)
+
+    _threading.Thread(target=_serve_maint, daemon=True,
+                      name='eFinder-maint').start()
+
+    # ------------------------------------------------------------------
+    # LX200 TCP server (port 4060)
+    # ------------------------------------------------------------------
     print('[lx200] starting on port 4060')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1125,15 +1432,18 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                     elif cmd == 'Me': _cmd('start_images', '1')
                     elif cmd == 'CM':
                         client.send(b'0')
-                        _cmd('measure_offset', timeout=30.0)
                         try:
                             rp = raStr.split(':')
-                            targetRa = int(rp[0]) + int(rp[1])/60 + int(rp[2])/3600
+                            target_ra_h = int(rp[0]) + int(rp[1])/60 + int(rp[2])/3600
+                            target_ra_deg = target_ra_h * 15.0
                             dp = decStr.split('*'); dd = dp[1].split(':')
-                            targetDec = int(dp[0]) + math.copysign(
+                            target_dec_deg = int(dp[0]) + math.copysign(
                                 int(dd[0])/60 + int(dd[1])/3600, float(dp[0]))
-                            print('[lx200] align target:', targetRa, targetDec)
-                        except Exception: pass
+                            print('[lx200] boresight_align target: RA=%.4f Dec=%.4f' %
+                                  (target_ra_deg, target_dec_deg))
+                            _cmd('boresight_align', target_ra_deg, target_dec_deg, timeout=30.0)
+                        except Exception:
+                            _cmd('measure_offset', timeout=30.0)
                     elif x and x[-1] == 'Q':
                         _cmd('start_images', '0')
                     elif cmd == 'PS':
@@ -1248,7 +1558,7 @@ def main():
 
     try:
         while True:
-            time.sleep(30)
+            time.sleep(10)
             for name, p in list(procs.items()):
                 if not p.is_alive():
                     print('[main] %s died (exit %s) — restarting' % (name, p.exitcode))
