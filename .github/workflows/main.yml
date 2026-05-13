@@ -39,9 +39,6 @@ jobs:
 
       # -----------------------------------------------------------------------
       # tetra3rs: cross-compile for aarch64 on the x86_64 runner.
-      # The compiled wheel is staged in the image so the chroot step uses it
-      # rather than pulling from PyPI, and the result has Cortex-A53 + NEON
-      # tuning that a generic PyPI wheel would not have.
       # -----------------------------------------------------------------------
       - name: Install Rust toolchain
         run: |
@@ -91,16 +88,10 @@ jobs:
 
       - name: Mount image and resize filesystem
         run: |
-          # Attach image to loop device
           LOOP=$(sudo losetup --find --show --partscan \
               2025-10-01-raspios-trixie-arm64-lite.img)
           echo "LOOP=$LOOP" >> $GITHUB_ENV
-
-          # Resize partition 2 to fill the image
-          # 'resizepart 2 100%' expands the partition
           sudo parted -s "$LOOP" resizepart 2 100%
-
-          # Check and resize the ext4 filesystem
           sudo e2fsck -f -y "${LOOP}p2" || true
           sudo resize2fs "${LOOP}p2"
 
@@ -112,7 +103,6 @@ jobs:
 
       - name: Define build variables
         run: |
-          # The script name to install (matches what's in the repo)
           echo "APP_SCRIPT=eFinder_tetra3rs_mp.py"   >> $GITHUB_ENV
           echo "EF_UID=1000"                          >> $GITHUB_ENV
           echo "EF_GID=1000"                          >> $GITHUB_ENV
@@ -131,7 +121,7 @@ jobs:
           sudo mkdir -p $ROOT/etc/NetworkManager/system-connections
 
           # -----------------------------------------------------------------------
-          # tetra3 database — downloaded from the tetra3rs repo
+          # tetra3 database
           # -----------------------------------------------------------------------
           wget -q --show-progress \
               https://github.com/ssmichael1/tetra3rs/releases/download/latest/hip_main.h5 \
@@ -139,8 +129,7 @@ jobs:
           sudo cp /tmp/hip_main.h5 $ROOT/home/efinder/Solver/
 
           # -----------------------------------------------------------------------
-          # Static IP / AP mode NetworkManager profile for the Pi's own hotspot.
-          # The Pi acts as an Access Point (AP) with a static 192.168.50.1 IP.
+          # NetworkManager AP profile
           # -----------------------------------------------------------------------
           NM=$ROOT/etc/NetworkManager/system-connections/efinder-ap.nmconnection
           sudo tee "$NM" > /dev/null << 'NMEOF'
@@ -170,8 +159,7 @@ NMEOF
           sudo chmod 600 "$NM"
 
           # -----------------------------------------------------------------------
-          # /boot/firmware/firstrun.sh — runs once on first boot via firstrun.service
-          # Sets hostname, locale, timezone, user, and tears itself down.
+          # /boot/firmware/firstrun.sh
           # -----------------------------------------------------------------------
           FBSCRIPT=$ROOT/boot/firmware/firstrun.sh
           echo "#!/bin/bash"                                                                        | sudo tee    "$FBSCRIPT" > /dev/null
@@ -196,13 +184,6 @@ NMEOF
           echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_wlan \"$WIFI_PASSWORD\" \"\" \"$WIFI_COUNTRY\"" | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "    NM=/etc/NetworkManager/system-connections/efinder-ap.nmconnection"         | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "    if [ ! -f \"\$NM\" ]; then"                                                | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "      cat > \"\$NM\" << 'NMEOF'"                                              | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "[connection]"                                                                  | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "NMEOF"                                                                         | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "      chmod 600 \"\$NM\""                                                     | sudo tee -a "$FBSCRIPT" > /dev/null
-          #echo "    fi"                                                                        | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    NM=/etc/NetworkManager/system-connections/efinder-ap.nmconnection"         | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    nmcli connection load \"\$NM\" 2>/dev/null || true"                        | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    nmcli connection up efinder-ap 2>/dev/null || true"                        | sudo tee -a "$FBSCRIPT" > /dev/null
@@ -244,8 +225,7 @@ NMEOF
           sudo chmod 755 "$FBSCRIPT"
 
           # -----------------------------------------------------------------------
-          # /etc/systemd/system/firstrun.service — one-shot unit that runs
-          # firstrun.sh on the very first boot and then removes itself.
+          # /etc/systemd/system/firstrun.service
           # -----------------------------------------------------------------------
           FBSVC=$ROOT/etc/systemd/system/firstrun.service
           sudo tee "$FBSVC" > /dev/null << 'SVCEOF'
@@ -271,30 +251,28 @@ SVCEOF
           # -----------------------------------------------------------------------
           sudo cp -r Solver/. $ROOT/home/efinder/Solver/
 
+          # Stage web UI
+          sudo mkdir -p $ROOT/home/efinder/webui
+          sudo cp -r webui/. $ROOT/home/efinder/webui/
+
           # Stage the source-compiled tetra3rs wheel
           sudo cp /tmp/tetra3rs-wheels/*.whl $ROOT/home/efinder/tetra3rs-src/
           echo "  tetra3rs wheel staged: $(ls /tmp/tetra3rs-wheels/*.whl)"
 
-          # Stage the LAN connection helper (user runs this post-flash if needed)
+          # Stage the LAN connection helper
           [ -f station.sh ] && sudo install -m 755 station.sh \
               $ROOT/home/efinder/station.sh
           [ -f sendcmd.sh ] && sudo install -m 755 sendcmd.sh \
               $ROOT/home/efinder/sendcmd.sh
 
-          # Fix ownership before chroot so pip/venv run as efinder correctly
+          # Fix ownership before chroot
           sudo chown -R ${EF_UID}:${EF_GID} $ROOT/home/efinder
 
-          echo "Base configuration complete — proceeding to chroot install"
+          echo "Base configuration complete"
           echo "LOOP=$LOOP" >> $GITHUB_ENV
 
       # -----------------------------------------------------------------------
-      # chroot step: everything that needs to run ARM64 binaries.
-      # QEMU user-mode emulation lets apt, pip, python3, etc. execute
-      # on the x86_64 runner as if they were on the Pi.
-      #
-      # NOTE: file writes inside the chroot use echo | tee rather than
-      # heredocs. Heredoc delimiters (EOF at column 0) are misread as
-      # top-level YAML keys and cause parse errors.
+      # chroot step
       # -----------------------------------------------------------------------
       - name: Set up QEMU for aarch64 chroot
         run: |
@@ -304,7 +282,6 @@ SVCEOF
           sudo mount --bind /dev/pts   /mnt/pi/dev/pts
           sudo mount --bind /proc      /mnt/pi/proc
           sudo mount --bind /sys       /mnt/pi/sys
-          # Block services starting inside the chroot
           echo '#!/bin/sh\nexit 101' | sudo tee /mnt/pi/usr/sbin/policy-rc.d > /dev/null
           sudo chmod +x /mnt/pi/usr/sbin/policy-rc.d
 
@@ -335,7 +312,10 @@ SVCEOF
             /home/efinder/venv-efinder/bin/pip install --upgrade pip
             /home/efinder/venv-efinder/bin/pip install \
                 smbus2 \
-                adafruit-circuitpython-bno055
+                adafruit-circuitpython-bno055 \
+                flask \
+                scipy \
+                pillow
           "
 
       - name: Install tetra3rs wheel in chroot
@@ -345,9 +325,9 @@ SVCEOF
             /home/efinder/venv-efinder/bin/pip install /home/efinder/tetra3rs-src/$(basename $WHEEL)
           "
 
-      - name: Configure Apache for eFinder web UI
+      - name: Configure Apache for optional use
         run: |
-          # Enable required Apache modules
+          # Enable required Apache modules (apache2 installed but not the primary web server)
           sudo chroot /mnt/pi a2enmod rewrite
           sudo chroot /mnt/pi a2enmod php8.2 2>/dev/null || \
               sudo chroot /mnt/pi a2enmod php   2>/dev/null || true
@@ -375,11 +355,6 @@ SAMBAEOF
         AllowOverride All
         Require all granted
     </Directory>
-    <Directory /home/efinder/uploads>
-        Options Indexes FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
     ErrorLog ${APACHE_LOG_DIR}/error.log
     CustomLog ${APACHE_LOG_DIR}/access.log combined
 </VirtualHost>
@@ -387,8 +362,6 @@ APEOF
 
           sudo chroot /mnt/pi a2ensite efinder
           sudo chroot /mnt/pi a2dissite 000-default || true
-
-          # Add www-data to efinder group so Apache can read Solver/
           sudo chroot /mnt/pi usermod -aG efinder www-data || true
 
       - name: Write system scripts and services (outside chroot)
@@ -398,7 +371,7 @@ APEOF
         run: |
 
           # ------------------------------------------------------------------
-          # apply_update.sh (OTA helper called by efinder-update.service)
+          # apply_update.sh
           # ------------------------------------------------------------------
           APPLY=$ROOT/home/efinder/Solver/apply_update.sh
           echo "#!/bin/bash"                                                                  | sudo tee    "$APPLY" > /dev/null
@@ -413,7 +386,7 @@ APEOF
           echo "        echo \"\$(date): Update applied successfully.\" >> \"\$LOG\""        | sudo tee -a "$APPLY" > /dev/null
           echo "        rm -f \"\$ZIPFILE\""                                                | sudo tee -a "$APPLY" > /dev/null
           echo "    else"                                                                    | sudo tee -a "$APPLY" > /dev/null
-          echo "    echo \"Update failed — removing zip.\""                                  | sudo tee -a "$APPLY" > /dev/null
+          echo "    echo \"Update failed --- removing zip.\""                               | sudo tee -a "$APPLY" > /dev/null
           echo "    rm -f \"\$ZIPFILE\""                                                    | sudo tee -a "$APPLY" > /dev/null
           echo "fi"                                                                          | sudo tee -a "$APPLY" > /dev/null
           sudo chmod 755 "$APPLY"
@@ -424,7 +397,6 @@ APEOF
           # ------------------------------------------------------------------
           AP=$ROOT/home/efinder/ap.sh
           echo "#!/bin/bash"                                                                     | sudo tee    "$AP" > /dev/null
-          echo "# ap.sh — switch to Access Point (hotspot) mode"                                | sudo tee -a "$AP" > /dev/null
           echo "set -e"                                                                          | sudo tee -a "$AP" > /dev/null
           echo "echo \"Switching to AP mode...\""                                               | sudo tee -a "$AP" > /dev/null
           echo "ACTIVE=\$(nmcli -t -f NAME,TYPE con show --active | grep wifi | grep -v efinder-ap | cut -d: -f1)" | sudo tee -a "$AP" > /dev/null
@@ -435,7 +407,7 @@ APEOF
           sudo chown 1000:1000 "$AP"
 
           # ------------------------------------------------------------------
-          # efinder-ensure-ap.sh — recovers AP after station-mode use
+          # efinder-ensure-ap.sh
           # ------------------------------------------------------------------
           ENSURE_AP_SH=$ROOT/usr/local/bin/efinder-ensure-ap.sh
           echo "#!/bin/bash"                                                                           | sudo tee    "$ENSURE_AP_SH" > /dev/null
@@ -476,7 +448,7 @@ APEOF
           # wifi-powersave-off
           WPS_SVC=$ROOT/etc/systemd/system/wifi-powersave-off.service
           echo "[Unit]"                                                                          | sudo tee    "$WPS_SVC" > /dev/null
-          echo "Description=Disable WiFi power save on wlan0 (eFinder latency optimization)"   | sudo tee -a "$WPS_SVC" > /dev/null
+          echo "Description=Disable WiFi power save on wlan0"                                   | sudo tee -a "$WPS_SVC" > /dev/null
           echo "After=NetworkManager.service sys-subsystem-net-devices-wlan0.device"           | sudo tee -a "$WPS_SVC" > /dev/null
           echo "Wants=NetworkManager.service"                                                   | sudo tee -a "$WPS_SVC" > /dev/null
           echo ""                                                                               | sudo tee -a "$WPS_SVC" > /dev/null
@@ -509,6 +481,8 @@ APEOF
           echo "WantedBy=multi-user.target"                                                    | sudo tee -a "$UPD_SVC" > /dev/null
 
           # efinder main service
+          # RuntimeDirectory=efinder creates /run/efinder (mode 0775, owner efinder)
+          # before the service starts, ensuring the maint socket can be bound.
           EF_SVC=$ROOT/etc/systemd/system/efinder.service
           echo "[Unit]"                                                                          | sudo tee    "$EF_SVC" > /dev/null
           echo "Description=eFinder tetra3rs_mp plate solver"                                  | sudo tee -a "$EF_SVC" > /dev/null
@@ -519,6 +493,8 @@ APEOF
           echo "User=efinder"                                                                   | sudo tee -a "$EF_SVC" > /dev/null
           echo "WorkingDirectory=/home/efinder/Solver"                                         | sudo tee -a "$EF_SVC" > /dev/null
           echo "Environment=PATH=/home/efinder/venv-efinder/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" | sudo tee -a "$EF_SVC" > /dev/null
+          echo "RuntimeDirectory=efinder"                                                       | sudo tee -a "$EF_SVC" > /dev/null
+          echo "RuntimeDirectoryMode=0775"                                                      | sudo tee -a "$EF_SVC" > /dev/null
           echo "ExecStartPre=/bin/sleep 2"                                                     | sudo tee -a "$EF_SVC" > /dev/null
           echo "ExecStart=/home/efinder/venv-efinder/bin/python /home/efinder/Solver/${APP_SCRIPT}" | sudo tee -a "$EF_SVC" > /dev/null
           echo "Restart=on-failure"                                                             | sudo tee -a "$EF_SVC" > /dev/null
@@ -531,10 +507,30 @@ APEOF
           echo "[Install]"                                                                      | sudo tee -a "$EF_SVC" > /dev/null
           echo "WantedBy=multi-user.target"                                                    | sudo tee -a "$EF_SVC" > /dev/null
 
+          # efinder-webui service (Flask web UI on port 80)
+          # Runs as root so it can bind port 80 and access /run/efinder/maint.sock.
+          WEBUI_SVC=$ROOT/etc/systemd/system/efinder-webui.service
+          echo "[Unit]"                                                                          | sudo tee    "$WEBUI_SVC" > /dev/null
+          echo "Description=eFinder Web UI (Flask)"                                            | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "After=network.target efinder.service"                                          | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "Wants=efinder.service"                                                         | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo ""                                                                               | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "[Service]"                                                                      | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "Type=simple"                                                                    | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "User=root"                                                                      | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "WorkingDirectory=/home/efinder/webui"                                          | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "Environment=PATH=/home/efinder/venv-efinder/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "ExecStart=/home/efinder/venv-efinder/bin/python app.py"                        | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "Restart=on-failure"                                                             | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "RestartSec=10"                                                                  | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "StandardOutput=journal"                                                         | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "StandardError=journal"                                                          | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo ""                                                                               | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "[Install]"                                                                      | sudo tee -a "$WEBUI_SVC" > /dev/null
+          echo "WantedBy=multi-user.target"                                                    | sudo tee -a "$WEBUI_SVC" > /dev/null
+
           # ------------------------------------------------------------------
-          # Samba firstboot service — sets default samba password on first boot.
-          # smbpasswd requires a live smbd; this runs after smbd is up.
-          # The user can change the password with: sudo smbpasswd efinder
+          # Samba firstboot service
           # ------------------------------------------------------------------
           SMB_FB=$ROOT/usr/local/bin/efinder-samba-firstboot.sh
           echo "#!/bin/bash"                                                                    | sudo tee    "$SMB_FB" > /dev/null
@@ -579,16 +575,16 @@ APEOF
           echo "WantedBy=multi-user.target"                                                         | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
 
           # ------------------------------------------------------------------
-          # Enable all services via symlinks (systemctl enable equivalent)
+          # Enable services via symlinks
+          # apache2 is installed but NOT enabled; efinder-webui serves port 80.
           # ------------------------------------------------------------------
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
-                     apache2 smbd nmbd efinder-samba-firstboot efinder-ensure-ap; do
+                     efinder-webui smbd nmbd efinder-samba-firstboot efinder-ensure-ap; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
-          # SSH enable
           sudo ln -sf /lib/systemd/system/ssh.service \
               $ROOT/etc/systemd/system/multi-user.target.wants/ssh.service 2>/dev/null || true
 
@@ -602,56 +598,33 @@ APEOF
 
       - name: Run raspi-config and image slimming in chroot
         run: |
-          # I2C and serial console
           sudo chroot /mnt/pi raspi-config nonint do_i2c 0        2>/dev/null || true
           sudo chroot /mnt/pi raspi-config nonint do_serial_cons 1 2>/dev/null || true
 
-          ## Locale generation (needs chroot to run locale-gen binary)
-          #sudo chroot /mnt/pi /usr/sbin/locale-gen
-          #sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
-
-          # Purge packages only needed during image build, not at runtime
           sudo chroot /mnt/pi apt-get purge -y \
               python3-pip \
               2>/dev/null || true
-              # protobuf-compiler build-essential cmake pkg-config libssl-dev \
-              
+
           sudo chroot /mnt/pi apt-get autoremove -y
           sudo chroot /mnt/pi apt-get clean
 
-          # Docs and manuals
           sudo rm -rf /mnt/pi/usr/share/doc/*
           sudo rm -rf /mnt/pi/usr/share/man/*
           sudo rm -rf /mnt/pi/usr/share/info/*
 
-          ## Non-English locale data (~30-50MB)
-          #sudo find /mnt/pi/usr/share/locale -mindepth 1 -maxdepth 1 \
-          #    ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
-          #    -exec rm -rf {} + 2>/dev/null || true
-          #sudo find /mnt/pi/usr/share/i18n/locales -mindepth 1 \
-          #    ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
-          #    -exec rm -rf {} + 2>/dev/null || true
-          
-          # Non-English locale data
           sudo find /mnt/pi/usr/share/locale -mindepth 1 -maxdepth 1 \
               ! -name 'en' ! -name 'en_US' ! -name 'locale.alias' \
               -exec rm -rf {} + 2>/dev/null || true
-          # sudo find /mnt/pi/usr/share/i18n/locales -mindepth 1 \
-          #     ! -name 'en_US' ! -name 'i18n' ! -name 'iso14651_t1*' \
-          #     -exec rm -rf {} + 2>/dev/null || true
 
-          # Generate locale AFTER purge so output isn't deleted
           sudo chroot /mnt/pi /usr/sbin/locale-gen
           sudo chroot /mnt/pi /usr/sbin/update-locale LANG=en_US.UTF-8
           sudo chroot /mnt/pi locale -a
-          
-          # Python __pycache__ — regenerates on first run
+
           sudo find /mnt/pi/home/efinder/venv-efinder -name '__pycache__' \
               -exec rm -rf {} + 2>/dev/null || true
           sudo find /mnt/pi/usr/lib/python3 -name '__pycache__' \
               -exec rm -rf {} + 2>/dev/null || true
 
-          # Remove staged wheel — installed into venv, no longer needed
           sudo rm -rf /mnt/pi/home/efinder/tetra3rs-src
 
           echo "  Image slimming complete."
