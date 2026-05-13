@@ -144,12 +144,12 @@ jobs:
           echo "#!/bin/bash"                                                                        | sudo tee    "$FBSCRIPT" > /dev/null
           echo "set -e"                                                                             | sudo tee -a "$FBSCRIPT" > /dev/null
           echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "CURRENT_HOSTNAME=\$(cat /etc/hostname | tr -d ' \\t\\n\\r')"                      | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "CURRENT_HOSTNAME=\$(cat /etc/hostname | tr -d ' \t\n\r')"                      | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_hostname efinder"              | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "else"                                                                              | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    echo efinder > /etc/hostname"                                                  | sudo tee -a "$FBSCRIPT" > /dev/null
-          echo "    sed -i \"s/127.0.1.1.*\$CURRENT_HOSTNAME/127.0.1.1\\tefinder/g\" /etc/hosts"  | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    sed -i \"s/127.0.1.1.*\$CURRENT_HOSTNAME/127.0.1.1\tefinder/g\" /etc/hosts"  | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
           echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "FIRSTUSER=\$(getent passwd 1000 | cut -d: -f1)"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
@@ -264,13 +264,13 @@ jobs:
                 i2c-tools \
                 libi2c-dev \
                 python3-smbus \
-                libcamera-apps \
                 apache2 \
                 php \
                 libapache2-mod-php \
                 samba \
                 samba-common-bin \
                 zram-tools
+            dpkg --configure -a || true
           "
 
       - name: Set up Python virtual environment in chroot
@@ -363,7 +363,7 @@ jobs:
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
-          echo "    if [[\"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\"]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[  \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
