@@ -39,6 +39,8 @@ jobs:
 
       # -----------------------------------------------------------------------
       # tetra3rs: cross-compile for aarch64 on the x86_64 runner.
+      # tetra3rs uses setuptools-rust; the pyo3 extension lives in python/.
+      # We invoke maturin directly against python/Cargo.toml to cross-compile.
       # -----------------------------------------------------------------------
       - name: Install Rust toolchain
         run: |
@@ -65,9 +67,9 @@ jobs:
           source "$HOME/.cargo/env"
           cd tetra3rs
           maturin build --release \
+              --manifest-path python/Cargo.toml \
               --target aarch64-unknown-linux-gnu \
               --zig \
-              --bindings pyo3 \
               --out /tmp/tetra3rs-wheels
           ls -lh /tmp/tetra3rs-wheels/
 
