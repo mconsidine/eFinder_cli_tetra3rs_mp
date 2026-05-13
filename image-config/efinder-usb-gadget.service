@@ -1,0 +1,12 @@
+[Unit]
+Description=eFinder USB serial ACM gadget (configfs)
+After=systemd-modules-load.service sys.mount
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/efinder-gadget-connect
+
+[Install]
+WantedBy=multi-user.target
