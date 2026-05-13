@@ -522,10 +522,7 @@ jobs:
           # ------------------------------------------------------------------
           # Zram swap configuration
           # ------------------------------------------------------------------
-          sudo tee $ROOT/etc/default/zramswap > /dev/null << 'ZRAMEOF'
-PERCENT=50
-ALGO=lz4
-ZRAMEOF
+          sudo cp image-config/zramswap "$ROOT/etc/default/zramswap"
 
           # ------------------------------------------------------------------
           # Enable services via symlinks
