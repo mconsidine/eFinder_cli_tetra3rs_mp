@@ -57,7 +57,7 @@ import numpy as np
 # Shared constants
 # ---------------------------------------------------------------------------
 home_path   = str(Path.home())
-version     = "6.7-tetra3rs-mp-tb12"
+version     = "6.7-tetra3rs-mp-tb9"
 config_path = os.path.join(home_path, "Solver/eFinder.config")
 solver_path = os.path.join(home_path, "Solver")
 
@@ -342,9 +342,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     _imu = None
     _imu_ref_quat  = None
     _imu_ref_radec = None
-    _imu_ref_time    = 0.0
-    _imu_calib_pairs = []
-    _imu_calib_C     = None
+    _imu_ref_time  = 0.0
     IMU_DR_MAX_AGE_S = 30.0
 
     if str(param.get('accelerometer', 'false')).strip().lower() == 'true':
@@ -401,73 +399,26 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         except Exception:
             return None
 
-    def _quat_delta_rotvec(q_new, q_old):
-        """Return rotation vector (axis × angle) from q_old to q_new."""
-        qow, qox, qoy, qoz = q_old
-        q_delta = _quat_mul(q_new, (qow, -qox, -qoy, -qoz))
-        dw, dx, dy, dz = q_delta
-        nrm = math.sqrt(dw*dw + dx*dx + dy*dy + dz*dz)
-        if nrm < 1e-10:
-            return (0.0, 0.0, 0.0)
-        dw /= nrm; dx /= nrm; dy /= nrm; dz /= nrm
-        angle = 2.0 * math.acos(max(-1.0, min(1.0, abs(dw))))
-        s = math.sin(angle / 2.0)
-        if angle < 1e-8 or abs(s) < 1e-10:
-            return (0.0, 0.0, 0.0)
-        return (dx / s * angle, dy / s * angle, dz / s * angle)
-
     def _imu_update_reference(ra_deg, dec_deg):
-        nonlocal _imu_ref_quat, _imu_ref_radec, _imu_ref_time, _imu_calib_pairs, _imu_calib_C
+        nonlocal _imu_ref_quat, _imu_ref_radec, _imu_ref_time
         q = _imu_read_quat()
         if q is None: return
-        if _imu_ref_quat is not None and _imu_ref_radec is not None:
-            rv = _quat_delta_rotvec(q, _imu_ref_quat)
-            d_ra = (ra_deg - _imu_ref_radec[0] + 180.0) % 360.0 - 180.0
-            d_dec = dec_deg - _imu_ref_radec[1]
-            _imu_calib_pairs.append((rv, (d_ra, d_dec)))
-            if len(_imu_calib_pairs) > 50:
-                _imu_calib_pairs = _imu_calib_pairs[-50:]
-            if len(_imu_calib_pairs) >= 3:
-                try:
-                    X = np.array([p[0] for p in _imu_calib_pairs])
-                    Y = np.array([p[1] for p in _imu_calib_pairs])
-                    C, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-                    _imu_calib_C = C
-                except Exception:
-                    pass
         _imu_ref_quat  = q
         _imu_ref_radec = (ra_deg, dec_deg)
         _imu_ref_time  = time.time()
 
     def _imu_dead_reckon():
+        """Return (ra_deg, dec_deg) estimated from IMU delta, or None."""
         if _imu_ref_quat is None: return None
         if time.time() - _imu_ref_time > IMU_DR_MAX_AGE_S: return None
         q_now = _imu_read_quat()
         if q_now is None: return None
-        if _imu_calib_C is not None:
-            try:
-                rv = _quat_delta_rotvec(q_now, _imu_ref_quat)
-                d_sky = np.array(rv) @ _imu_calib_C
-                ra  = (_imu_ref_radec[0] + float(d_sky[0])) % 360.0
-                dec = max(-90.0, min(90.0, _imu_ref_radec[1] + float(d_sky[1])))
-                return (ra, dec)
-            except Exception:
-                pass
         qr = _imu_ref_quat
         qr_conj = (qr[0], -qr[1], -qr[2], -qr[3])
         q_delta = _quat_mul(q_now, qr_conj)
         v0 = _radec_to_vec(_imu_ref_radec[0], _imu_ref_radec[1])
         v1 = _quat_rotate(q_delta, v0)
         return _vec_to_radec(v1)
-
-    # --- Polar aligner ---
-    try:
-        from polar_run import PolarAligner
-        _polar_aligner = PolarAligner()
-        print('[solver] polar aligner ready')
-    except Exception as _pa_e:
-        print('[solver] polar aligner not available:', _pa_e)
-        _polar_aligner = None
 
     # --- FOV calibration ---
     _FOV_MIN, _FOV_MAX = 5, 30
@@ -519,7 +470,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     SEEDED_TIMEOUT_MS      = 2000
     BLIND_TIMEOUT_MS       = 5000
     RESEED_TOLERANCE_DEG   = 4.0
-    _HINT_MAX_AGE_S        = 30.0
 
     _PEAK_ATTR = None
     try:
@@ -564,21 +514,18 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         return 0
 
     # solver state
-    solve          = False
-    _dr_active     = [False]
-    solved_radec   = (0.0, 0.0)
-    solution       = None
+    solve         = False
+    _dr_active    = [False]
+    solved_radec  = (0.0, 0.0)
+    solution      = None
     centroids_last = []
-    firstCentroid  = None
-    stars          = '0'
-    peak           = '0'
-    eTime          = '00.00'
-    keep           = False
-    frame_n        = 0
-    offset_str     = '%1.3f,%1.3f' % (0.0, 0.0)
-    _detect_sigma  = float(param.get('detect_sigma', '10.0'))
-    _sol_camera_model = None
-    _last_solve_time  = 0.0
+    firstCentroid = None
+    stars         = '0'
+    peak          = '0'
+    eTime         = '00.00'
+    keep          = False
+    frame_n       = 0
+    offset_str    = '%1.3f,%1.3f' % (0.0, 0.0)
 
     _state_snapshot = {}
     _state_lock     = _Lock()
@@ -723,6 +670,9 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         t0 = time.time()
         np_img = img if img.dtype == np.uint8 else img.astype(np.uint8)
 
+        # Dark-frame fast-path: skip Rust FFI entirely when there is no
+        # real signal. np_img.max() costs ~0.1 ms; avoiding extract_centroids
+        # saves 50-300 ms per frame with lens cap on or overcast sky.
         local_peak = int(np_img.max())
         if local_peak < 20:
             solve = False
@@ -783,15 +733,9 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                     stars, param['Exposure'], param['Gain']))
             return False
 
-        solution         = sol
-        centroids_last   = centroid_list
-        firstCentroid    = centroid_list[0]
-        _last_solve_time = time.time()
-        try:
-            if sol.camera_model is not None:
-                _sol_camera_model = sol.camera_model
-        except Exception:
-            pass
+        solution       = sol
+        centroids_last = centroid_list
+        firstCentroid  = centroid_list[0]
 
         try:
             target = sol.pixel_to_world(offset_cx, offset_cy)
@@ -817,9 +761,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         shared_dec.value = dec
 
         _imu_update_reference(ra, dec)
-
-        if _polar_aligner:
-            _polar_aligner.update_from_solve(ra, dec)
 
         try:
             print('[solver] JNow', coordinates.hh2dms(ra / 15),
@@ -1464,23 +1405,6 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                     elif cmd == 'St':
                         site_lat = x[3:]
                         client.send(b'1')
-                        # Feed latitude to polar aligner via solver queue
-                        try:
-                            lat_str = site_lat.replace('*', ':').split(':')
-                            lat_deg = float(lat_str[0])
-                            if len(lat_str) > 1:
-                                sign = 1 if lat_deg >= 0 else -1
-                                lat_deg += sign * float(lat_str[1]) / 60
-                            if len(lat_str) > 2:
-                                sign = 1 if lat_deg >= 0 else -1
-                                lat_deg += sign * float(lat_str[2]) / 3600
-                            lx200_cmd_q.put(('polar_set_latitude', lat_deg, None))
-                            try:
-                                lx200_result_q.get(timeout=1.0)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
                     elif cmd == 'Sg':
                         site_lon = x[3:]
                         client.send(b'1')
