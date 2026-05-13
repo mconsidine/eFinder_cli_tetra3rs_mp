@@ -54,7 +54,7 @@ jobs:
       - name: Install maturin and ziglang
         run: |
           sudo apt-get install -y python3-dev
-          pip install "maturin>=1.4" ziglang
+          pip install "maturin>=1.9" ziglang
 
       - name: Clone tetra3rs
         run: |
