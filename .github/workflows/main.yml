@@ -265,6 +265,10 @@ SVCEOF
           [ -f sendcmd.sh ] && sudo install -m 755 sendcmd.sh \
               $ROOT/home/efinder/sendcmd.sh
 
+          # Install efinder-ctl management script
+          [ -f scripts/efinder-ctl ] && sudo install -m 755 scripts/efinder-ctl \
+              $ROOT/usr/local/bin/efinder-ctl
+
           # Fix ownership before chroot
           sudo chown -R ${EF_UID}:${EF_GID} $ROOT/home/efinder
 
@@ -302,7 +306,8 @@ SVCEOF
                 php \
                 libapache2-mod-php \
                 samba \
-                samba-common-bin
+                samba-common-bin \
+                zram-tools
           "
 
       - name: Set up Python virtual environment in chroot
@@ -416,7 +421,7 @@ APEOF
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
-          echo "    if [[ \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[  \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
@@ -575,13 +580,22 @@ APEOF
           echo "WantedBy=multi-user.target"                                                         | sudo tee -a "$ENSURE_AP_SVC" > /dev/null
 
           # ------------------------------------------------------------------
+          # Zram swap configuration
+          # ------------------------------------------------------------------
+          sudo tee $ROOT/etc/default/zramswap > /dev/null << 'ZRAMEOF'
+PERCENT=50
+ALGO=lz4
+ZRAMEOF
+
+          # ------------------------------------------------------------------
           # Enable services via symlinks
           # apache2 is installed but NOT enabled; efinder-webui serves port 80.
           # ------------------------------------------------------------------
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
-                     efinder-webui smbd nmbd efinder-samba-firstboot efinder-ensure-ap; do
+                     efinder-webui smbd nmbd efinder-samba-firstboot efinder-ensure-ap \
+                     zramswap; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
