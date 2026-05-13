@@ -131,14 +131,6 @@ jobs:
           sudo mkdir -p $ROOT/etc/NetworkManager/system-connections
 
           # -----------------------------------------------------------------------
-          # tetra3 database
-          # -----------------------------------------------------------------------
-          wget -q --show-progress \
-              https://github.com/ssmichael1/tetra3rs/releases/latest/download/hip_main.h5 \
-              -O /tmp/hip_main.h5
-          sudo cp /tmp/hip_main.h5 $ROOT/home/efinder/Solver/
-
-          # -----------------------------------------------------------------------
           # NetworkManager AP profile
           # -----------------------------------------------------------------------
           NM=$ROOT/etc/NetworkManager/system-connections/efinder-ap.nmconnection
@@ -371,7 +363,7 @@ jobs:
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "for i in \$(seq 1 \"\$MAX_POLLS\"); do"                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    STATE=\$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep \"^wlan0:\" | cut -d: -f2)" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
-          echo "    if [[ \"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\" ]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "    if [[\"\$STATE\" == \"connected\" || \"\$STATE\" == \"activated\"]]; then" | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "        exit 0"                                                                       | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    fi"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "    sleep \"\$POLL_INTERVAL\""                                                     | sudo tee -a "$ENSURE_AP_SH" > /dev/null
