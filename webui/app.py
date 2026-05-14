@@ -252,6 +252,40 @@ def exposure_set():
     return redirect(url_for("camera_page"))
 
 
+@app.route("/api/camera/set", methods=["POST"])
+def api_camera_set():
+    """JSON endpoint for the camera page's live slider auto-apply.
+    Accepts any subset of: exposure_s, gain.
+    Does not persist to config -- use the form's Apply & save button for that.
+    """
+    data = request.get_json(silent=True) or {}
+    errors = []
+    applied = {}
+    if "exposure_s" in data:
+        try:
+            s = float(data["exposure_s"])
+            r = _safe_call("exposure_set", {"exposure_s": s})
+            if r.ok:
+                applied["exposure_s"] = s
+            else:
+                errors.append(f"exposure: {r.error}")
+        except (ValueError, TypeError) as e:
+            errors.append(f"exposure_s invalid: {e}")
+    if "gain" in data:
+        try:
+            g = float(data["gain"])
+            r = _safe_call("gain_set", {"gain": g})
+            if r.ok:
+                applied["gain"] = g
+            else:
+                errors.append(f"gain: {r.error}")
+        except (ValueError, TypeError) as e:
+            errors.append(f"gain invalid: {e}")
+    if errors:
+        return jsonify({"ok": False, "errors": errors, "applied": applied}), 400
+    return jsonify({"ok": True, "applied": applied})
+
+
 # ------------------------------------------------------------------
 # Wi-Fi management
 # ------------------------------------------------------------------

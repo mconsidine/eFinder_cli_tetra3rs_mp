@@ -42,7 +42,8 @@
                    value="{{ exposure.gain }}">
           </div>
         </label>
-        <button type="submit" class="btn">Apply</button>
+        <p id="exp-status" class="hint" style="min-height:1.2em;">&nbsp;</p>
+        <button type="submit" class="btn">Apply &amp; save</button>
       </form>
     {% else %}
       <p class="muted">Daemon not reachable.</p>
@@ -66,19 +67,56 @@ function refreshFrame() {
 }
 setInterval(refreshFrame, 2000);
 
+function debounce(fn, ms) {
+  let t;
+  return function(...args) { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+function setStatus(id, msg, ok) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = ok ? '#44cc44' : '#ff5500';
+  if (ok) setTimeout(() => { if (el.textContent === msg) el.textContent = ' '; }, 2000);
+}
+
+async function applyParams(params, statusId) {
+  setStatus(statusId, 'Applying…', true);
+  try {
+    const r = await fetch('/api/camera/set', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params),
+    });
+    const data = await r.json();
+    if (data.ok) setStatus(statusId, 'Applied', true);
+    else setStatus(statusId, 'Error: ' + (data.errors || []).join(', '), false);
+  } catch(e) {
+    setStatus(statusId, 'Error: ' + e.message, false);
+  }
+}
+
+const applyExp  = debounce(s => applyParams({exposure_s: s}, 'exp-status'), 400);
+const applyGain = debounce(g => applyParams({gain: g},       'exp-status'), 400);
+
 function expSliderChange(v) {
   const s = Math.pow(10, parseFloat(v));
   document.getElementById('exp_num').value = s.toFixed(4).replace(/\.?0+$/, '');
+  applyExp(s);
 }
 function gainSliderChange(v) {
-  document.getElementById('gain_num').value = Math.round(v);
+  const g = Math.round(v);
+  document.getElementById('gain_num').value = g;
+  applyGain(g);
 }
 function gainNumChange(v) {
-  document.getElementById('gain_slider').value = Math.round(parseFloat(v));
+  const g = Math.round(parseFloat(v));
+  document.getElementById('gain_slider').value = g;
+  applyGain(g);
 }
 function expNumChange(v) {
   const s = parseFloat(v);
-  if (s > 0) document.getElementById('exp_slider').value = Math.log10(s);
+  if (s > 0) { document.getElementById('exp_slider').value = Math.log10(s); applyExp(s); }
 }
 const expNum = document.getElementById('exp_num');
 const gainNum = document.getElementById('gain_num');
