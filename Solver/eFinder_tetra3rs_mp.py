@@ -848,10 +848,11 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         except Exception:
             return slot_bufs[latest_slot.value].copy()
 
-    def _set_camera(exp, gain):
+    def _set_camera(exp, gain, persist=True):
         param['Exposure'] = str(exp)
         param['Gain']     = str(gain)
-        save_param(param)
+        if persist:
+            save_param(param)
         cam_cmd_q.put(('set_exp', exp, gain))
 
     def _lookup_star(catalog_id):
@@ -886,11 +887,13 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             _set_camera(a, b); return '1'
 
         elif cmd == 'set_exp':
-            _set_camera(float(a), param.get('Gain','20')); return '1'
+            persist = bool(b) if b is not None else True
+            _set_camera(float(a), param.get('Gain','20'), persist=persist); return '1'
 
         elif cmd == 'set_gain':
             g = max(1, min(64, float(a) if a is not None else 20))
-            _set_camera(param.get('Exposure', '0.2'), '%.1f' % g)
+            persist = bool(b) if b is not None else True
+            _set_camera(param.get('Exposure', '0.2'), '%.1f' % g, persist=persist)
             return '%.1f' % g
 
         elif cmd == 'auto_exp':
@@ -1240,12 +1243,14 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                 exp_s = args.get('exposure_s')
                 if exp_s is None:
                     return MaintResponse(ok=False, error='exposure_s required')
-                qcmd, qa, qb, qtimeout = 'set_exp', float(exp_s), None, 10.0
+                persist = bool(args.get('persist', True))
+                qcmd, qa, qb, qtimeout = 'set_exp', float(exp_s), persist, 10.0
             elif cmd == 'gain_set':
                 gain = args.get('gain')
                 if gain is None:
                     return MaintResponse(ok=False, error='gain required')
-                qcmd, qa, qb, qtimeout = 'set_gain', float(gain), None, 10.0
+                persist = bool(args.get('persist', True))
+                qcmd, qa, qb, qtimeout = 'set_gain', float(gain), persist, 10.0
             elif cmd == 'boresight_set':
                 y = args.get('y')
                 x = args.get('x')
@@ -1567,7 +1572,7 @@ def main():
                                     name='eFinder-' + name, daemon=True)
                     new_p.start()
                     procs[name] = new_p
-                    print('[main] %s restarted (pid %d)' % (name, new_p.pid))
+                    print('[main] restarted (pid %d)' % (name, new_p.pid))
     except KeyboardInterrupt:
         print('eFinder stopped.')
     finally:

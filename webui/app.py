@@ -236,7 +236,7 @@ def camera_page():
 def exposure_set():
     try:
         s = float(request.form.get("exposure_s", ""))
-        r = _safe_call("exposure_set", {"exposure_s": s})
+        r = _safe_call("exposure_set", {"exposure_s": s, "persist": True})
         if not r.ok:
             return r.error, 400
     except ValueError:
@@ -244,7 +244,7 @@ def exposure_set():
     if request.form.get("gain"):
         try:
             g = float(request.form.get("gain"))
-            r = _safe_call("gain_set", {"gain": g})
+            r = _safe_call("gain_set", {"gain": g, "persist": True})
             if not r.ok:
                 return r.error, 400
         except ValueError:
@@ -264,7 +264,7 @@ def api_camera_set():
     if "exposure_s" in data:
         try:
             s = float(data["exposure_s"])
-            r = _safe_call("exposure_set", {"exposure_s": s})
+            r = _safe_call("exposure_set", {"exposure_s": s, "persist": False})
             if r.ok:
                 applied["exposure_s"] = s
             else:
@@ -274,7 +274,7 @@ def api_camera_set():
     if "gain" in data:
         try:
             g = float(data["gain"])
-            r = _safe_call("gain_set", {"gain": g})
+            r = _safe_call("gain_set", {"gain": g, "persist": False})
             if r.ok:
                 applied["gain"] = g
             else:
