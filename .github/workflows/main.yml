@@ -188,6 +188,10 @@ jobs:
           echo "    nmcli connection load \"\$NM\" 2>/dev/null || true"                        | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    nmcli connection up efinder-ap 2>/dev/null || true"                        | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "nmcli con modify efinder-ap connection.autoconnect yes connection.autoconnect-retries 0 2>/dev/null || true" | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "if ! nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: '\$2==\"wlan0\"{exit 0} END{exit 1}'; then" | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "    nmcli con up efinder-ap 2>/dev/null || true"                                   | sudo tee -a "$FBSCRIPT" > /dev/null
+          echo "fi"                                                                                | sudo tee -a "$FBSCRIPT" > /dev/null
           echo ""                                                                                   | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then"                       | sudo tee -a "$FBSCRIPT" > /dev/null
           echo "    /usr/lib/raspberrypi-sys-mods/imager_custom set_timezone America/New_York"     | sudo tee -a "$FBSCRIPT" > /dev/null
