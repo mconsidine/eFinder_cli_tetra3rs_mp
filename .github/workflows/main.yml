@@ -389,6 +389,10 @@ jobs:
           # ------------------------------------------------------------------
           ENSURE_AP_SH=$ROOT/usr/local/bin/efinder-ensure-ap.sh
           echo "#!/bin/bash"                                                                           | sudo tee    "$ENSURE_AP_SH" > /dev/null
+          echo "rfkill unblock wifi 2>/dev/null || true"                                              | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "iw reg set US 2>/dev/null || true"                                                    | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "nmcli radio wifi on 2>/dev/null || true"                                              | sudo tee -a "$ENSURE_AP_SH" > /dev/null
+          echo "sleep 2"                                                                               | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "AP_PROFILE=\"efinder-ap\""                                                          | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "POLL_INTERVAL=5"                                                                      | sudo tee -a "$ENSURE_AP_SH" > /dev/null
           echo "MAX_POLLS=12"                                                                         | sudo tee -a "$ENSURE_AP_SH" > /dev/null
@@ -569,6 +573,16 @@ jobs:
           grep -qxF "dwc2" $ROOT/etc/initramfs-tools/modules 2>/dev/null || \
               echo "dwc2" | sudo tee -a $ROOT/etc/initramfs-tools/modules > /dev/null
 
+          # Drop-in override: agetty --local-line so it doesn't exit on missing
+          # carrier-detect (USB ACM gadgets never assert CD).
+          # serial-getty@ttyGS0.service is started by efinder-usb-gadget.service
+          # ExecStartPost once /dev/ttyGS0 exists, not via WANTS symlink.
+          GETTY_DROP_DIR=$ROOT/etc/systemd/system/serial-getty@ttyGS0.service.d
+          sudo mkdir -p "$GETTY_DROP_DIR"
+          echo "[Service]"                                                                        | sudo tee    "$GETTY_DROP_DIR/local-line.conf" > /dev/null
+          echo "ExecStart="                                                                      | sudo tee -a "$GETTY_DROP_DIR/local-line.conf" > /dev/null
+          echo "ExecStart=-/sbin/agetty --local-line 115200 ttyGS0 vt100"                       | sudo tee -a "$GETTY_DROP_DIR/local-line.conf" > /dev/null
+
           # ------------------------------------------------------------------
           # Zram swap configuration
           # ------------------------------------------------------------------
@@ -577,6 +591,8 @@ jobs:
           # ------------------------------------------------------------------
           # Enable services via symlinks
           # apache2 is installed but NOT enabled; efinder-webui serves port 80.
+          # serial-getty@ttyGS0 is NOT in this list -- it is started by
+          # efinder-usb-gadget.service ExecStartPost after the device exists.
           # ------------------------------------------------------------------
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
@@ -590,8 +606,6 @@ jobs:
               "$WANTS/zramswap.service" 2>/dev/null || true
           sudo ln -sf /lib/systemd/system/ssh.service \
               $ROOT/etc/systemd/system/multi-user.target.wants/ssh.service 2>/dev/null || true
-          sudo ln -sf /lib/systemd/system/serial-getty@.service \
-              "$WANTS/serial-getty@ttyGS0.service" 2>/dev/null || true
 
           # ------------------------------------------------------------------
           # Fix final ownership
@@ -605,6 +619,7 @@ jobs:
         run: |
           sudo chroot /mnt/pi raspi-config nonint do_i2c 0        2>/dev/null || true
           sudo chroot /mnt/pi raspi-config nonint do_serial_cons 1 2>/dev/null || true
+          sudo chroot /mnt/pi raspi-config nonint do_wifi_country US 2>/dev/null || true
 
           sudo chroot /mnt/pi apt-get purge -y \
               python3-pip \
