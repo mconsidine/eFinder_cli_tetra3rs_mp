@@ -77,7 +77,7 @@ function setStatus(id, msg, ok) {
   if (!el) return;
   el.textContent = msg;
   el.style.color = ok ? '#44cc44' : '#ff5500';
-  if (ok) setTimeout(() => { if (el.textContent === msg) el.textContent = ' '; }, 2000);
+  if (ok) setTimeout(() => { if (el.textContent === msg) el.textContent = ' '; }, 2000);
 }
 
 async function applyParams(params, statusId) {
