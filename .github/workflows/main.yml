@@ -259,7 +259,8 @@ jobs:
                 adafruit-circuitpython-bno055 \\
                 flask \\
                 scipy \\
-                pillow
+                pillow \\
+                gaia-catalog
           "
 
       - name: Install tetra3rs wheel in chroot
@@ -612,6 +613,7 @@ print('[db] done: %d stars, %d patterns' % (db.num_stars, db.num_patterns), flus
               -exec rm -rf {} + 2>/dev/null || true
 
           sudo rm -rf /mnt/pi/home/efinder/tetra3rs-src
+          sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip uninstall -y gaia-catalog 2>/dev/null || true
 
           echo "  Image slimming complete."
           df -h /mnt/pi
