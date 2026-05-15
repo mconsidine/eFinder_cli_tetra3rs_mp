@@ -231,20 +231,20 @@ jobs:
         run: |
           sudo chroot /mnt/pi /bin/bash -c "
             apt-get update -q
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                python3-pip \
-                python3-venv \
-                python3-picamera2 \
-                python3-numpy \
-                i2c-tools \
-                libi2c-dev \
-                python3-smbus \
-                apache2 \
-                php \
-                libapache2-mod-php \
-                samba \
-                samba-common-bin \
-                zram-tools \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \\
+                python3-pip \\
+                python3-venv \\
+                python3-picamera2 \\
+                python3-numpy \\
+                i2c-tools \\
+                libi2c-dev \\
+                python3-smbus \\
+                apache2 \\
+                php \\
+                libapache2-mod-php \\
+                samba \\
+                samba-common-bin \\
+                zram-tools \\
                 initramfs-tools
             dpkg --configure -a || true
           "
@@ -254,12 +254,13 @@ jobs:
           sudo chroot /mnt/pi /bin/bash -c "
             python3 -m venv --system-site-packages /home/efinder/venv-efinder
             /home/efinder/venv-efinder/bin/pip install --upgrade pip
-            /home/efinder/venv-efinder/bin/pip install \
-                smbus2 \
-                adafruit-circuitpython-bno055 \
-                flask \
-                scipy \
-                pillow
+            /home/efinder/venv-efinder/bin/pip install \\
+                smbus2 \\
+                adafruit-circuitpython-bno055 \\
+                flask \\
+                scipy \\
+                pillow \\
+                gaia-catalog
           "
 
       - name: Install tetra3rs wheel in chroot
@@ -268,6 +269,24 @@ jobs:
           sudo chroot /mnt/pi /bin/bash -c "
             /home/efinder/venv-efinder/bin/pip install /home/efinder/tetra3rs-src/$(basename $WHEEL)
           "
+
+      - name: Generate tetra3rs star database in chroot
+        run: |
+          sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/python3 -c "
+import tetra3rs, sys
+print('[db] generating star database — this may take several minutes', flush=True)
+db = tetra3rs.SolverDatabase.generate_from_gaia(
+    max_fov_deg=11,
+    star_max_magnitude=8.0,
+    patterns_per_lattice_field=100,
+    epoch_proper_motion_year=2026,
+    verification_stars_per_fov=150,
+)
+db.save_to_file('/home/efinder/Solver/tetra3_index_1.6_0.4.bin')
+print('[db] done: %d stars, %d patterns' % (db.num_stars, db.num_patterns), flush=True)
+"
+          sudo ls -lh /mnt/pi/home/efinder/Solver/tetra3_index_1.6_0.4.bin
+          echo "  Star database baked into image."
 
       - name: Update initramfs for USB gadget (dwc2)
         run: |
@@ -594,6 +613,7 @@ jobs:
               -exec rm -rf {} + 2>/dev/null || true
 
           sudo rm -rf /mnt/pi/home/efinder/tetra3rs-src
+          sudo chroot /mnt/pi /home/efinder/venv-efinder/bin/pip uninstall -y gaia-catalog 2>/dev/null || true
 
           echo "  Image slimming complete."
           df -h /mnt/pi
