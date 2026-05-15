@@ -5,7 +5,7 @@ Thin Flask client of the maintenance Unix socket at /run/efinder/maint.sock.
 Serves port 80 on all interfaces on the eFinder's private network.
 
 Frame and focus images are read from /dev/shm/efinder_live.jpg written by
-the solver's live-writer thread (contrast-enhanced, rotated 180 degrees).
+the solver's live-writer thread (contrast-enhanced).
 No SHM slot access needed from the web layer.
 """
 
@@ -18,6 +18,7 @@ import re as _re
 import subprocess
 import sys
 import threading
+import time
 
 from flask import (
     Flask, render_template, redirect, url_for, request, jsonify,
@@ -115,10 +116,29 @@ def _dms(deg):
 # Dashboard
 # ------------------------------------------------------------------
 
+# Calibration changes ~once per 30 solves; cache for 5 s so concurrent
+# dashboard auto-refresh polls don't pile up on the solver lock.
+_cal_cache_lock = threading.Lock()
+_cal_cache: dict = {"result": None, "ts": 0.0}
+_CAL_CACHE_TTL = 5.0
+
+
+def _get_calibration_status():
+    with _cal_cache_lock:
+        if _cal_cache["result"] is not None and \
+                time.monotonic() - _cal_cache["ts"] < _CAL_CACHE_TTL:
+            return _cal_cache["result"]
+    r = _safe_call("calibration_status")
+    with _cal_cache_lock:
+        _cal_cache["result"] = r
+        _cal_cache["ts"] = time.monotonic()
+    return r
+
+
 @app.route("/")
 def dashboard():
     status = _safe_call("status")
-    cal = _safe_call("calibration_status")
+    cal = _get_calibration_status()
 
     sol = (_format_solution(status.result.get("solution"))
            if status.ok and status.result else None)
@@ -143,7 +163,7 @@ def dashboard():
 @app.route("/api/status")
 def api_status():
     status = _safe_call("status")
-    cal = _safe_call("calibration_status")
+    cal = _get_calibration_status()
     return jsonify({
         "status":      {"ok": status.ok, "result": status.result, "error": status.error},
         "calibration": {"ok": cal.ok,    "result": cal.result,    "error": cal.error},
@@ -484,8 +504,8 @@ def frame_jpg():
     """Serve the live JPEG with a red boresight circle overlaid.
 
     Reads /dev/shm/efinder_live.jpg produced by the solver's live-writer
-    thread (contrast-enhanced, rotated 180 deg).  Boresight position
-    from the maint socket status response.
+    thread (contrast-enhanced).  Boresight position from the maint socket
+    status response.
     """
     from PIL import Image, ImageDraw
 
