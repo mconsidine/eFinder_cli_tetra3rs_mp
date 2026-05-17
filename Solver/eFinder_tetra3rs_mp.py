@@ -228,12 +228,6 @@ def apply_update(url):
 restart_counts = {}
 
 def _start_worker(spec, shared):
-    """
-    Start a worker process from a proc_spec dict.
-    spec keys: name, target, args (optional extra positional args)
-    shared: tuple of shared objects prepended to args.
-    Returns multiprocessing.Process.
-    """
     name = spec['name']
     restart_counts.setdefault(name, 0)
     extra = spec.get('args', ())
@@ -363,7 +357,7 @@ def solver_worker(
 
     param = load_param()
 
-    # ── calibrator (FovCalibrator requires param, save_param_fn, fov_estimate, frame_width) ──
+    # ── calibrator ──
     _calibrator = FovCalibrator(
         param,
         save_param,
@@ -381,12 +375,22 @@ def solver_worker(
 
     # ── solver state ──
     solved_radec   = None    # (ra_deg, dec_deg) J2000
-    solve          = True    # actively solving when True
-    offset_cx      = offset_cy = 0.0
-    offset_str     = 'no offset'
+    solve          = True
     frame_n        = 0
-    _fov_measured  = None   # degrees
+    _fov_measured  = None
     _detect_sigma  = float(param.get('Sigma', '8'))
+
+    # Restore persisted boresight offset so alignment survives restarts
+    offset_cx  = float(param.get('OffsetCX', '0.0'))
+    offset_cy  = float(param.get('OffsetCY', '0.0'))
+    if offset_cx or offset_cy:
+        offset_str    = 'boresight cx=%.1f cy=%.1f' % (offset_cx, offset_cy)
+        offset_flag.value = True
+    else:
+        offset_str    = 'no offset'
+
+    # Auto-exposure loop state
+    _auto_exp_state = {'last_stars': 0, 'last_adj': 0.0}
 
     # ── result JSON path ──
     result_path = os.path.join(home_path, 'Solver/solve_result.json')
@@ -402,9 +406,9 @@ def solver_worker(
     # ── catalogue for seeded solve ──
     catalogue = load_catalogue()
 
-    # ── IMU calibration state (accumulates solve-pair training data) ──
+    # ── IMU calibration state ──
     _imu_calib_state = {
-        'pairs':     [],   # list of (rotvec_3, cam_r, cam_u)
+        'pairs':     [],
         'prev_q':    None,
         'prev_ra':   None,
         'prev_dec':  None,
@@ -412,7 +416,6 @@ def solver_worker(
     }
 
     def _refit_imu_calib():
-        """Least-squares fit of the 2x3 IMU->camera calibration matrix."""
         pairs = _imu_calib_state['pairs']
         n = len(pairs)
         shared_cfg['imu_calib_n'] = n
@@ -421,22 +424,20 @@ def solver_worker(
         try:
             X = np.array([[rv[0], rv[1], rv[2]] for rv, cr, cu in pairs])
             Y = np.array([[cr, cu]               for rv, cr, cu in pairs])
-            C_T = np.linalg.lstsq(X, Y, rcond=None)[0]  # (3, 2)
-            C   = C_T.T                                   # (2, 3)
+            C_T = np.linalg.lstsq(X, Y, rcond=None)[0]
+            C   = C_T.T
             Y_pred  = X @ C_T
             ss_res  = float(np.sum((Y - Y_pred) ** 2))
             ss_tot  = float(np.sum((Y - Y.mean(axis=0)) ** 2))
             quality = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
             shared_cfg['imu_calib_C']       = C.ravel().tolist()
             shared_cfg['imu_calib_quality'] = max(0.0, min(1.0, quality))
-            log.debug('[solver] imu calib n=%d quality=%.3f', n, quality)
         except Exception as _e:
             log.debug('[solver] imu refit error: %s', _e)
 
     # ── helpers ──
 
     def _request_capture():
-        """Signal camera and wait for fresh frame; return copy."""
         frame_ready.clear()
         cam_cmd_q.put(('capture_now',))
         if not frame_ready.wait(CAPTURE_TIMEOUT):
@@ -466,7 +467,6 @@ def solver_worker(
         if solved_radec:
             ra_hint, dec_hint = solved_radec
 
-        # seeded solve first if we have a prior position
         result = None
         if ra_hint is not None and fov_hint is not None:
             try:
@@ -484,7 +484,6 @@ def solver_worker(
                 result = None
 
         if result is None:
-            # blind solve
             try:
                 result = solver.solve_from_centroids(
                     ext,
@@ -500,28 +499,31 @@ def solver_worker(
         if result is None:
             return False
 
-        ra_deg  = result.ra
-        dec_deg = result.dec
+        ra_deg   = result.ra
+        dec_deg  = result.dec
         roll_deg = getattr(result, 'roll', 0.0) or 0.0
         if hasattr(result, 'fov'):
             _fov_measured = result.fov
             _calibrator.update_from_solve(result.fov)
 
-        # apply offset
+        # apply boresight offset
         if offset_flag.value and (offset_cx or offset_cy):
-            plate_scale = (_fov_measured or float(param.get('FOV','5.0'))) / FRAME_H  # deg/px
+            plate_scale = (_fov_measured or float(param.get('FOV','5.0'))) / FRAME_H
             dec_deg += offset_cy * plate_scale
             ra_deg  += offset_cx * plate_scale / max(0.01, math.cos(math.radians(dec_deg)))
 
-        solved_radec        = (ra_deg, dec_deg)
-        shared_ra.value     = ra_deg
-        shared_dec.value    = dec_deg
+        solved_radec     = (ra_deg, dec_deg)
+        shared_ra.value  = ra_deg
+        shared_dec.value = dec_deg
 
-        _stars  = len(ext.centroids) if hasattr(ext, 'centroids') else 0
-        _peak   = _centroid_peak(ext.centroids, img) if hasattr(ext, 'centroids') else 0
+        _stars   = len(ext.centroids) if hasattr(ext, 'centroids') else 0
+        _peak    = _centroid_peak(ext.centroids, img) if hasattr(ext, 'centroids') else 0
         _matches = getattr(result, 'matches', 0) or getattr(result, 'num_matches', 0)
 
-        # ── identify nearest catalogue star ──
+        # Record star count for auto-exposure loop
+        _auto_exp_state['last_stars'] = _stars
+
+        # nearest catalogue star
         name = sn = hipId = ''
         if catalogue:
             ra_r  = math.radians(ra_deg)
@@ -539,8 +541,7 @@ def solver_worker(
                 cat_id = best[1]['id']
                 name, sn, hipId = _lookup_star(cat_id)
 
-        # ── write result JSON ──
-        ra_h  = ra_deg  / 15.0
+        ra_h    = ra_deg / 15.0
         ra_hms  = '%02dh%02dm%05.2fs' % (int(ra_h), int((ra_h%1)*60), ((ra_h*60)%1)*60)
         dec_dms = '%+03dd%02dm%05.2fs' % (int(dec_deg), int(abs(dec_deg)%1*60),
                                            (abs(dec_deg)*60%1)*60)
@@ -569,28 +570,25 @@ def solver_worker(
         except Exception:
             pass
 
-        # ── update IMU dead-reckoning reference and accumulate training pair ──
+        # IMU dead-reckoning reference + calibration pair
         if shared_cfg.get('imu_available', False):
             q_now = shared_cfg.get('imu_q')
             if q_now is not None:
                 t_now = time.monotonic()
-                # Always update the reference quaternion (origin for dead-reckoning)
                 shared_cfg['imu_ref_q']        = q_now
                 shared_cfg['imu_ref_ra_deg']   = ra_deg
                 shared_cfg['imu_ref_dec_deg']  = dec_deg
                 shared_cfg['imu_ref_t']        = t_now
                 shared_cfg['imu_ref_roll_deg'] = roll_deg
-                # Accumulate a calibration training pair from the previous solve
                 if _imu_calib_state['prev_q'] is not None:
                     try:
                         rv = _quat_delta_rotvec(q_now, _imu_calib_state['prev_q'])
-                        dra_deg  = ((ra_deg  - _imu_calib_state['prev_ra']  + 180) % 360) - 180
+                        dra_deg  = ((ra_deg - _imu_calib_state['prev_ra']  + 180) % 360) - 180
                         ddec_deg =   dec_deg - _imu_calib_state['prev_dec']
-                        # Only include pairs with sane deltas (< 10 deg)
                         if abs(dra_deg) < 10 and abs(ddec_deg) < 10:
                             pr       = math.radians(_imu_calib_state['prev_roll'] or 0.0)
                             cos_dec  = math.cos(math.radians(dec_deg))
-                            dra_rad  = math.radians(dra_deg) * cos_dec  # arc-length
+                            dra_rad  = math.radians(dra_deg) * cos_dec
                             ddec_rad = math.radians(ddec_deg)
                             cam_r =  dra_rad * math.cos(pr) + ddec_rad * math.sin(pr)
                             cam_u = -dra_rad * math.sin(pr) + ddec_rad * math.cos(pr)
@@ -607,12 +605,33 @@ def solver_worker(
 
         return True
 
-    def _set_camera(exp, gain, persist=True):
+    def _set_camera(exp, gn, persist=True):
         param['Exposure'] = str(exp)
-        param['Gain']     = str(gain)
+        param['Gain']     = str(gn)
         if persist:
             save_param(param)
-        cam_cmd_q.put(('set_exp', exp, gain))
+        cam_cmd_q.put(('set_exp', exp, gn))
+
+    def _do_auto_exp():
+        """Closed-loop exposure adjustment based on detected star count."""
+        nc     = _auto_exp_state['last_stars']
+        target = int(param.get('AutoExpTargetStars', '20'))
+        mn     = float(param.get('AutoExpMin', '0.05'))
+        mx     = float(param.get('AutoExpMax', '4.0'))
+        exp    = float(param.get('Exposure', '0.2'))
+        now    = time.monotonic()
+        if now - _auto_exp_state['last_adj'] < 5.0:
+            return
+        if nc < max(1, int(target * 0.6)) and exp < mx:
+            new_exp = min(mx, round(exp * 1.4, 3))
+            _set_camera(new_exp, float(param.get('Gain', '20')), persist=False)
+            _auto_exp_state['last_adj'] = now
+            log.debug('[solver] auto_exp up:   %d stars exp %.3f->%.3f', nc, exp, new_exp)
+        elif nc > target * 2 and exp > mn:
+            new_exp = max(mn, round(exp * 0.7, 3))
+            _set_camera(new_exp, float(param.get('Gain', '20')), persist=False)
+            _auto_exp_state['last_adj'] = now
+            log.debug('[solver] auto_exp down: %d stars exp %.3f->%.3f', nc, exp, new_exp)
 
     _star_name_dict = {}
     try:
@@ -686,7 +705,42 @@ def solver_worker(
             offset_cx = offset_cy = 0.0
             offset_str = 'no offset'
             offset_flag.value = False
+            param.pop('OffsetCX', None)
+            param.pop('OffsetCY', None)
+            save_param(param)
             return 'ok'
+
+        elif cmd == 'align':
+            # a = target RA degrees (str), b = target Dec degrees (str)
+            # Plate-solve with offset disabled to get raw frame centre,
+            # then compute pixel offset from centre to target star.
+            try:
+                ra_t  = float(a)
+                dec_t = float(b)
+                prev_flag = offset_flag.value
+                offset_flag.value = False
+                img = _request_capture()
+                ok  = _do_solve(img)
+                if not ok:
+                    offset_flag.value = prev_flag
+                    return 'fail:no_solve'
+                ra_c, dec_c = solved_radec
+                ps = (_fov_measured or float(param.get('FOV', '5.0'))) / FRAME_H
+                cos_dec = math.cos(math.radians(dec_c))
+                dra     = ((ra_t - ra_c + 180) % 360) - 180
+                offset_cx = dra * cos_dec / ps
+                offset_cy = (dec_t - dec_c) / ps
+                offset_str = 'boresight cx=%.1f cy=%.1f' % (offset_cx, offset_cy)
+                offset_flag.value = True
+                param['OffsetCX'] = '%.4f' % offset_cx
+                param['OffsetCY'] = '%.4f' % offset_cy
+                save_param(param)
+                log.info('[solver] boresight set: cx=%.1f cy=%.1f (ra_t=%.4f dec_t=%.4f)',
+                         offset_cx, offset_cy, ra_t, dec_t)
+                return 'ok'
+            except Exception as _e:
+                log.warning('[solver] align error: %s', _e)
+                return 'fail:%s' % _e
 
         elif cmd == 'auto_exp':
             img = _request_capture()
@@ -794,7 +848,6 @@ def solver_worker(
     MAINT_SOCK_PATH = '/run/efinder/maint.sock'
 
     def _dispatch_maint(cmd, args):
-        """Translate webui maint commands to solver internals."""
         nonlocal _fov_measured, solve, solved_radec
 
         if cmd == 'ping':
@@ -862,11 +915,23 @@ def solver_worker(
             return {'gain': g}
 
         elif cmd == 'solver_params_get':
-            return dict(param)
+            return {
+                'Sigma':              param.get('Sigma', '8'),
+                'FOV':                param.get('FOV', '5.0'),
+                'AutoExp':            param.get('AutoExp', 'false'),
+                'AutoExpTargetStars': param.get('AutoExpTargetStars', '20'),
+                'AutoExpMin':         param.get('AutoExpMin', '0.05'),
+                'AutoExpMax':         param.get('AutoExpMax', '4.0'),
+            }
 
         elif cmd == 'solver_params_set':
+            allowed = {'Sigma', 'FOV', 'AutoExp', 'AutoExpTargetStars', 'AutoExpMin', 'AutoExpMax'}
             for k, v in args.items():
-                param[k] = str(v)
+                if k in allowed:
+                    param[k] = str(v)
+                    if k == 'Sigma':
+                        nonlocal _detect_sigma
+                        _detect_sigma = float(v)
             save_param(param)
             return {'ok': True}
 
@@ -892,7 +957,6 @@ def solver_worker(
             raise ValueError('unknown maint command: %s' % cmd)
 
     def _maint_client_thread(conn):
-        """Handle one maint connection: newline-delimited JSON in/out."""
         buf = b''
         try:
             while True:
@@ -925,7 +989,6 @@ def solver_worker(
                 pass
 
     def _maint_server_thread():
-        """Bind Unix socket at MAINT_SOCK_PATH and accept connections."""
         sock_dir = os.path.dirname(MAINT_SOCK_PATH)
         try:
             os.makedirs(sock_dir, exist_ok=True)
@@ -968,7 +1031,6 @@ def solver_worker(
     # ── main solve loop ──
     log.info('[solver] started')
     while keep.value:
-        # service command queue (non-blocking)
         try:
             item = cmd_q.get_nowait()
             cmd, a, b = item if len(item)==3 else (*item, '', '')
@@ -987,8 +1049,11 @@ def solver_worker(
             img = frame.copy()
             frame_n += 1
             ok = _do_solve(img)
-            if ok and _polar.state not in (PolarState.IDLE, PolarState.DONE, PolarState.ERROR):
-                _polar.update_from_solve(shared_ra.value, shared_dec.value)
+            if ok:
+                if param.get('AutoExp', 'false').lower() in ('1', 'true', 'yes'):
+                    _do_auto_exp()
+                if _polar.state not in (PolarState.IDLE, PolarState.DONE, PolarState.ERROR):
+                    _polar.update_from_solve(shared_ra.value, shared_dec.value)
         except Exception as e:
             log.warning('[solver] loop error: %s', e)
 
@@ -1015,17 +1080,14 @@ def lx200_worker(
     host  = param.get('Host', '0.0.0.0')
     port  = int(param.get('Port', '4030'))
 
-    # pending command state
-    _pending_cmd  = None
-    _pending_lock = threading.Lock()
     _result_ready = threading.Event()
     _last_result  = [None]
 
-    def _send_cmd(cmd, a='', b=''):
-        """Send command to solver; return response (blocks up to 2 s)."""
+    def _send_cmd(cmd, a='', b='', timeout=2.0):
+        """Send command to solver; block up to timeout seconds for reply."""
         _result_ready.clear()
         cmd_q.put((cmd, a, b))
-        _result_ready.wait(timeout=2.0)
+        _result_ready.wait(timeout=timeout)
         return _last_result[0]
 
     def _result_poller():
@@ -1039,10 +1101,54 @@ def lx200_worker(
 
     threading.Thread(target=_result_poller, daemon=True).start()
 
-    # ── LX200 parser ──
+    # ── RA/Dec parsing helpers ──
+
+    def _parse_ra_hms(s):
+        """Parse LX200 RA string HH:MM:SS or HH:MM.M to decimal degrees."""
+        s = s.strip()
+        parts = s.replace(':', ' ').split()
+        h   = float(parts[0])
+        m   = float(parts[1]) if len(parts) > 1 else 0.0
+        sec = float(parts[2]) if len(parts) > 2 else 0.0
+        return (h + m / 60.0 + sec / 3600.0) * 15.0
+
+    def _parse_dec_dms(s):
+        """Parse LX200 Dec string sDD*MM:SS or sDD*MM to decimal degrees."""
+        s = s.strip()
+        sign = -1 if s.startswith('-') else 1
+        s = s.lstrip('+-')
+        parts = s.replace('*', ':').replace(':', ' ').split()
+        d   = float(parts[0])
+        m   = float(parts[1]) if len(parts) > 1 else 0.0
+        sec = float(parts[2]) if len(parts) > 2 else 0.0
+        return sign * (d + m / 60.0 + sec / 3600.0)
+
+    # ── alignment and clock state (per-connection, but placed here for clarity) ──
+    _align_target = {'ra_deg': None, 'dec_deg': None}
+    _time_state   = {'sl': None, 'sg': None}
+
+    def _sync_clock(sl, sg, sc):
+        """Convert SkySafari :SL/:SG/:SC payload to UTC and sync system clock."""
+        try:
+            local_dt = datetime.datetime.strptime('%s %s' % (sc, sl), '%m/%d/%y %H:%M:%S')
+            # LX200 :SG sign: positive = hours west; UTC = local + west_hours
+            utc_dt  = local_dt + datetime.timedelta(hours=float(sg))
+            now_utc = datetime.datetime.utcnow()
+            diff_s  = abs((utc_dt - now_utc).total_seconds())
+            if diff_s < 10:
+                log.debug('[lx200] clock already accurate (drift %.0fs), skipping sync', diff_s)
+                return
+            time_str = utc_dt.strftime('%Y-%m-%d %H:%M:%S')
+            log.info('[lx200] clock drift %.0fs — syncing to %s UTC', diff_s, time_str)
+            subprocess.run(['sudo', 'date', '-s', time_str],
+                           capture_output=True, timeout=10)
+        except Exception as _e:
+            log.warning('[lx200] clock sync error: %s', _e)
+
+    # ── LX200 formatter/parser ──
 
     def _ra_to_lx200(ra_deg):
-        h = ra_deg / 15.0
+        h  = ra_deg / 15.0
         hh = int(h)
         mm = int((h - hh) * 60)
         ss = int(((h - hh) * 60 - mm) * 60)
@@ -1050,14 +1156,13 @@ def lx200_worker(
 
     def _dec_to_lx200(dec_deg):
         sign = '+' if dec_deg >= 0 else '-'
-        d = abs(dec_deg)
+        d  = abs(dec_deg)
         dd = int(d)
         mm = int((d - dd) * 60)
         ss = int(((d - dd) * 60 - mm) * 60)
         return '%s%02d*%02d:%02d' % (sign, dd, mm, ss)
 
     def _handle_lx200(data, conn):
-        """Process one LX200 command string; send response via conn."""
         data = data.strip()
         if not data: return
 
@@ -1081,22 +1186,29 @@ def lx200_worker(
             else:
                 send(_dec_to_lx200(shared_dec.value) + '#')
 
-        # :GS# — get sidereal time (dummy)
+        # :GS# — sidereal time (synthetic)
         elif data == ':GS#':
             t  = datetime.datetime.utcnow()
             hh = (t.hour + t.minute/60 + t.second/3600) % 24
             send(_ra_to_lx200(hh * 15) + '#')
 
-        # :SC# — sync / set date (ignore, acknowledge)
-        elif data.startswith(':SC'):
-            send('1Updating        #')
-
-        # :CM# — sync on current position
+        # :CM# — sync / boresight alignment
         elif data == ':CM#':
-            _send_cmd('solve_now')
-            send('Synced          #')
+            ra_t  = _align_target.get('ra_deg')
+            dec_t = _align_target.get('dec_deg')
+            if ra_t is not None and dec_t is not None:
+                resp = _send_cmd('align', str(ra_t), str(dec_t), timeout=15.0)
+                _align_target['ra_deg'] = _align_target['dec_deg'] = None
+                if str(resp or '').startswith('ok'):
+                    send('Synced          #')
+                else:
+                    log.warning('[lx200] align failed: %s', resp)
+                    send('Align failed    #')
+            else:
+                _send_cmd('solve_now')
+                send('Synced          #')
 
-        # :Q# — stop (no-op for plate solver)
+        # :Q# — stop (no-op)
         elif data == ':Q#':
             pass
 
@@ -1104,11 +1216,11 @@ def lx200_worker(
         elif data == ':MS#':
             send('0')
 
-        # :GW# — mount status (required for SkySafari init handshake)
+        # :GW# — mount status (SkySafari init handshake)
         elif data == ':GW#':
             send('AT2#')
 
-        # :GVP#/:GVN#/:GVF#/:GVD#/:GVT# — firmware version queries
+        # :GV* — firmware version queries
         elif data.startswith(':GV'):
             send('eFinder-tetra3rs#')
 
@@ -1120,7 +1232,7 @@ def lx200_worker(
         elif data == ':Gr#':
             send('4#')
 
-        # :GA# — altitude (not tracked, return zero)
+        # :GA# — altitude
         elif data == ':GA#':
             send('+00*00#')
 
@@ -1142,20 +1254,18 @@ def lx200_worker(
         elif data == ':GG#':
             send('+0.0#')
 
-        # :Gt# — site latitude (return stored value or 0)
+        # :Gt# — site latitude
         elif data == ':Gt#':
-            lat = param.get('Latitude', '0.0')
-            deg = float(lat)
+            deg  = float(param.get('Latitude', '0.0'))
             sign = '+' if deg >= 0 else '-'
-            d = abs(deg)
+            d    = abs(deg)
             send('%s%02d*%02d#' % (sign, int(d), int((d % 1) * 60)))
 
         # :Gg# — site longitude
         elif data == ':Gg#':
-            lon = param.get('Longitude', '0.0')
-            deg = float(lon)
+            deg  = float(param.get('Longitude', '0.0'))
             sign = '+' if deg >= 0 else '-'
-            d = abs(deg)
+            d    = abs(deg)
             send('%s%03d*%02d#' % (sign, int(d), int((d % 1) * 60)))
 
         # :St# — set site latitude
@@ -1168,31 +1278,57 @@ def lx200_worker(
             param['Longitude'] = data[3:].rstrip('#')
             send('1')
 
-        # :SL# — set local time (acknowledge, ignore)
+        # :SL# — set local time (accumulate for clock sync)
         elif data.startswith(':SL'):
+            _time_state['sl'] = data[3:].rstrip('#').strip()
             send('1')
 
-        # :SG# — set UTC offset (acknowledge, ignore)
+        # :SG# — set UTC offset (accumulate for clock sync)
         elif data.startswith(':SG'):
+            try:
+                _time_state['sg'] = float(data[3:].rstrip('#').strip())
+            except ValueError:
+                pass
             send('1')
 
-        # :Sr# — set target RA (acknowledge)
+        # :SC# — set date; trigger clock sync if :SL and :SG were received
+        elif data.startswith(':SC'):
+            sc_val = data[3:].rstrip('#').strip()
+            sl_val = _time_state.get('sl')
+            sg_val = _time_state.get('sg')
+            if sl_val and sg_val is not None:
+                threading.Thread(target=_sync_clock,
+                                 args=(sl_val, sg_val, sc_val),
+                                 daemon=True).start()
+            send('1Updating        #')
+
+        # :Sr# — set target RA (parse and store for :CM# alignment)
         elif data.startswith(':Sr'):
-            send('1')
+            raw = data[3:].rstrip('#')
+            try:
+                _align_target['ra_deg'] = _parse_ra_hms(raw)
+                send('1')
+            except Exception:
+                send('0')
 
-        # :Sd# — set target Dec (acknowledge)
+        # :Sd# — set target Dec (parse and store for :CM# alignment)
         elif data.startswith(':Sd'):
-            send('1')
+            raw = data[3:].rstrip('#')
+            try:
+                _align_target['dec_deg'] = _parse_dec_dms(raw)
+                send('1')
+            except Exception:
+                send('0')
 
-        # :MA#/:Me#/:Mw#/:Mn#/:Ms# — motion commands (no-op)
+        # motion commands — no-op
         elif data.startswith(':M') and data != ':MS#':
             send('')
 
-        # :Re#/:Rw#/:Rn#/:Rs# — rate commands (acknowledge)
+        # rate commands — no-op
         elif data.startswith(':R'):
             send('')
 
-        # efinder extensions via :X<cmd> #
+        # efinder extensions via :X<cmd>#
         elif data.startswith(':X'):
             inner = data[2:].rstrip('#').strip()
             parts = inner.split(None, 2)
@@ -1290,7 +1426,7 @@ def main():
     # event
     frame_ready = mp.Event()
 
-    # IMU shared state (manager dict — accessible from all worker processes)
+    # IMU shared state (Manager dict — accessible from all worker processes)
     mgr = mp.Manager()
     shared_cfg = mgr.dict({
         'imu_available':    False,
