@@ -545,11 +545,6 @@ jobs:
           USB_GADGET_SVC=$ROOT/etc/systemd/system/efinder-usb-gadget.service
           sudo cp image-config/efinder-usb-gadget.service "$USB_GADGET_SVC"
 
-          # Dedicated serial console: Restart=always keeps getty alive through
-          # reconnects; --local-line ignores USB carrier-detect signals.
-          sudo cp image-config/efinder-serial-console.service \
-              $ROOT/etc/systemd/system/efinder-serial-console.service
-
           sudo mkdir -p $ROOT/etc/modules-load.d
           sudo cp image-config/efinder-gadget.conf \
               $ROOT/etc/modules-load.d/efinder-gadget.conf
@@ -557,6 +552,16 @@ jobs:
           sudo mkdir -p $ROOT/etc/initramfs-tools
           grep -qxF "dwc2" $ROOT/etc/initramfs-tools/modules 2>/dev/null || \
               echo "dwc2" | sudo tee -a $ROOT/etc/initramfs-tools/modules > /dev/null
+
+          # ------------------------------------------------------------------
+          # USB serial console: standard serial-getty@ttyGS0 template unit.
+          # BindsTo=dev-ttyGS0.device (built into the template) means systemd
+          # starts the getty automatically when efinder-gadget-connect creates
+          # ttyGS0; Restart=always (also in the template) handles reconnects.
+          # ------------------------------------------------------------------
+          sudo mkdir -p $ROOT/etc/systemd/system/getty.target.wants
+          sudo ln -sf /lib/systemd/system/serial-getty@.service \
+              $ROOT/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service
 
           # ------------------------------------------------------------------
           # efinder-firstboot service (runs firstboot.sh on every boot)
@@ -576,8 +581,7 @@ jobs:
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
                      efinder-webui smbd nmbd efinder-samba-firstboot \
-                     efinder-firstboot efinder-ensure-ap efinder-usb-gadget \
-                     efinder-serial-console; do
+                     efinder-firstboot efinder-ensure-ap efinder-usb-gadget; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
