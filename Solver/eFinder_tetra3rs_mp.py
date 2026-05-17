@@ -109,7 +109,7 @@ def _pin_to_cpu(cpu):
         log.warning('could not pin to CPU %d: %s', cpu, e)
 
 
-# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_param():
     """Load key=value config; return dict."""
     p = {}
@@ -485,12 +485,13 @@ def solver_worker(
                 result = solver.solve_from_centroids(
                     ext,
                     (FRAME_H, FRAME_W),
-                    fov_estimate   = fov_hint,
-                    fov_max_error  = 0.2,
-                    target_ra      = ra_hint,
-                    target_dec     = dec_hint,
-                    search_radius  = 5.0,
-                    match_threshold= 1e-5,
+                    fov_estimate    = fov_hint,
+                    fov_max_error   = 0.2,
+                    target_ra       = ra_hint,
+                    target_dec      = dec_hint,
+                    search_radius   = 5.0,
+                    match_threshold = 1e-5,
+                    solve_timeout   = int(param.get('SolveTimeoutMs', '1500')) / 1000.0,
                 )
             except Exception:
                 result = None
@@ -942,13 +943,13 @@ def solver_worker(
 
         elif cmd == 'exposure_set':
             s = float(args.get('exposure_s', param.get('Exposure', '0.2')))
-            persist = bool(args.get('persist', True))
+            persist = bool(args.get('persist', False))
             _set_camera(s, float(param.get('Gain', '20')), persist=persist)
             return {'exposure_s': s}
 
         elif cmd == 'gain_set':
             g = float(args.get('gain', param.get('Gain', '20')))
-            persist = bool(args.get('persist', True))
+            persist = bool(args.get('persist', False))
             _set_camera(float(param.get('Exposure', '0.2')), g, persist=persist)
             return {'gain': g}
 
@@ -990,7 +991,7 @@ def solver_worker(
 
         elif cmd == 'polar_cancel':
             _polar.cancel()
-            return {'ok': True}
+            return _polar.get_status()
 
         elif cmd == 'polar_set_latitude':
             lat = float(args.get('latitude_deg', 0.0))
@@ -1170,10 +1171,6 @@ def lx200_worker(
         sec = float(parts[2]) if len(parts) > 2 else 0.0
         return sign * (d + m / 60.0 + sec / 3600.0)
 
-    # ── alignment and clock state (per-connection, but placed here for clarity) ──
-    _align_target = {'ra_deg': None, 'dec_deg': None}
-    _time_state   = {'sl': None, 'sg': None}
-
     def _sync_clock(sl, sg, sc):
         """Convert SkySafari :SL/:SG/:SC payload to UTC and sync system clock."""
         try:
@@ -1209,7 +1206,7 @@ def lx200_worker(
         ss = int(((d - dd) * 60 - mm) * 60)
         return '%s%02d*%02d:%02d' % (sign, dd, mm, ss)
 
-    def _handle_lx200(data, conn):
+    def _handle_lx200(data, conn, align_target, time_state):
         data = data.strip()
         if not data: return
 
@@ -1241,11 +1238,11 @@ def lx200_worker(
 
         # :CM# — sync / boresight alignment
         elif data == ':CM#':
-            ra_t  = _align_target.get('ra_deg')
-            dec_t = _align_target.get('dec_deg')
+            ra_t  = align_target.get('ra_deg')
+            dec_t = align_target.get('dec_deg')
             if ra_t is not None and dec_t is not None:
                 resp = _send_cmd('align', str(ra_t), str(dec_t), timeout=15.0)
-                _align_target['ra_deg'] = _align_target['dec_deg'] = None
+                align_target['ra_deg'] = align_target['dec_deg'] = None
                 if str(resp or '').startswith('ok'):
                     send('Synced          #')
                 else:
@@ -1303,43 +1300,54 @@ def lx200_worker(
 
         # :Gt# — site latitude
         elif data == ':Gt#':
-            deg  = float(param.get('Latitude', '0.0'))
+            try:
+                deg = float(param.get('Latitude', '0.0'))
+            except ValueError:
+                deg = 0.0
             sign = '+' if deg >= 0 else '-'
             d    = abs(deg)
             send('%s%02d*%02d#' % (sign, int(d), int((d % 1) * 60)))
 
         # :Gg# — site longitude
         elif data == ':Gg#':
-            deg  = float(param.get('Longitude', '0.0'))
+            try:
+                deg = float(param.get('Longitude', '0.0'))
+            except ValueError:
+                deg = 0.0
             sign = '+' if deg >= 0 else '-'
             d    = abs(deg)
             send('%s%03d*%02d#' % (sign, int(d), int((d % 1) * 60)))
 
-        # :St# — set site latitude; parse and propagate live to polar aligner
+        # :St# — set site latitude; parse DMS before storing, propagate to polar aligner
         elif data.startswith(':St'):
             raw = data[3:].rstrip('#')
-            param['Latitude'] = raw
             try:
                 lat = _parse_dec_dms(raw)
+                param['Latitude'] = str(lat)
                 _send_cmd('set_lat', str(lat))
             except Exception:
-                pass
+                param['Latitude'] = raw
             send('1')
 
-        # :Sg# — set site longitude
+        # :Sg# — set site longitude; parse DMS before storing
         elif data.startswith(':Sg'):
-            param['Longitude'] = data[3:].rstrip('#')
+            raw = data[3:].rstrip('#')
+            try:
+                lon = _parse_dec_dms(raw)
+                param['Longitude'] = str(lon)
+            except Exception:
+                param['Longitude'] = raw
             send('1')
 
         # :SL# — set local time (accumulate for clock sync)
         elif data.startswith(':SL'):
-            _time_state['sl'] = data[3:].rstrip('#').strip()
+            time_state['sl'] = data[3:].rstrip('#').strip()
             send('1')
 
         # :SG# — set UTC offset (accumulate for clock sync)
         elif data.startswith(':SG'):
             try:
-                _time_state['sg'] = float(data[3:].rstrip('#').strip())
+                time_state['sg'] = float(data[3:].rstrip('#').strip())
             except ValueError:
                 pass
             send('1')
@@ -1347,8 +1355,8 @@ def lx200_worker(
         # :SC# — set date; trigger clock sync if :SL and :SG were received
         elif data.startswith(':SC'):
             sc_val = data[3:].rstrip('#').strip()
-            sl_val = _time_state.get('sl')
-            sg_val = _time_state.get('sg')
+            sl_val = time_state.get('sl')
+            sg_val = time_state.get('sg')
             if sl_val and sg_val is not None:
                 threading.Thread(target=_sync_clock,
                                  args=(sl_val, sg_val, sc_val),
@@ -1359,7 +1367,7 @@ def lx200_worker(
         elif data.startswith(':Sr'):
             raw = data[3:].rstrip('#')
             try:
-                _align_target['ra_deg'] = _parse_ra_hms(raw)
+                align_target['ra_deg'] = _parse_ra_hms(raw)
                 send('1')
             except Exception:
                 send('0')
@@ -1368,7 +1376,7 @@ def lx200_worker(
         elif data.startswith(':Sd'):
             raw = data[3:].rstrip('#')
             try:
-                _align_target['dec_deg'] = _parse_dec_dms(raw)
+                align_target['dec_deg'] = _parse_dec_dms(raw)
                 send('1')
             except Exception:
                 send('0')
@@ -1400,6 +1408,16 @@ def lx200_worker(
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except Exception:
             pass
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass  # TCP_KEEPIDLE etc. are Linux-only
+        conn.settimeout(float(param.get('LX200ClientTimeoutS', '30.0')))
+        align_target = {'ra_deg': None, 'dec_deg': None}
+        time_state   = {}
         buf = ''
         try:
             while keep.value:
@@ -1408,7 +1426,9 @@ def lx200_worker(
                 buf += chunk.decode(errors='replace')
                 while '#' in buf:
                     cmd, _, buf = buf.partition('#')
-                    _handle_lx200(cmd + '#', conn)
+                    _handle_lx200(cmd + '#', conn, align_target, time_state)
+        except socket.timeout:
+            log.debug('[lx200] client %s timed out', addr)
         except Exception as e:
             log.debug('[lx200] client error: %s', e)
         finally:
