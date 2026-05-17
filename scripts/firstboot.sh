@@ -71,8 +71,8 @@ nmcli radio wifi on 2>/dev/null || WARN "nmcli radio wifi on failed (non-fatal)"
 sleep 1
 
 # --- Wi-Fi access point profile -----------------------------------------------
-# Create the AP profile if it doesn't exist. If it does, leave it alone
-# (the user may have customised the SSID or password via ap.sh).
+# Create the AP profile if it doesn't exist, then always apply the
+# device-unique MAC-based SSID (overrides any static placeholder from the image).
 
 MAC=$(ip link show wlan0 2>/dev/null | awk '/ether/ {gsub(":",""); print $2; exit}')
 if [ -n "${MAC:-}" ]; then
@@ -84,7 +84,7 @@ fi
 AP_PASS="12345678"
 
 if ! nmcli -t -f NAME con show | grep -qx "efinder-ap"; then
-  LOG "Creating Wi-Fi AP profile: SSID=$AP_SSID"
+  LOG "Creating Wi-Fi AP profile"
   nmcli con add \
     type wifi \
     ifname wlan0 \
@@ -99,11 +99,14 @@ if ! nmcli -t -f NAME con show | grep -qx "efinder-ap"; then
     wifi-sec.key-mgmt wpa-psk \
     wifi-sec.psk "$AP_PASS" \
     || WARN "Could not create AP profile"
-
-  LOG "  SSID=$AP_SSID  password=$AP_PASS  IP=10.42.0.1"
-else
-  LOG "AP profile already exists -- leaving it unchanged"
 fi
+
+# Always update the SSID to the device-unique MAC-based name.
+# The image bakes in a static placeholder; this overwrites it on every
+# boot so the SSID always reflects this specific device's MAC.
+nmcli con mod efinder-ap wifi.ssid "$AP_SSID" 2>/dev/null \
+  || WARN "Could not set SSID on AP profile"
+LOG "AP profile: SSID=$AP_SSID  password=$AP_PASS  IP=10.42.0.1"
 
 # Ensure NM will always retry the AP connection. autoconnect-retries=0
 # means retry indefinitely; without this NM stops trying after a few

@@ -7,7 +7,6 @@ Wants=systemd-modules-load.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/efinder-gadget-connect
-ExecStartPost=-/bin/systemctl start serial-getty@ttyGS0.service
 Restart=on-failure
 RestartSec=15s
 StartLimitIntervalSec=120s
