@@ -69,7 +69,7 @@ try:
 except ImportError:
     Picamera2 = None  # allow import for unit-testing on non-Pi hosts
 
-# ── logging ──────────────────────────────────────────────────────────────────────────────────────
+# ── logging ────────────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level   = logging.INFO,
     format  = '%(asctime)s %(processName)-14s %(levelname)s %(message)s',
@@ -77,11 +77,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── paths ────────────────────────────────────────────────────────────────────────────────────
+# ── paths ──────────────────────────────────────────────────────────────────────────────────
 home_path  = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _param_path = os.path.join(home_path, 'Solver/eFinder.config')
 
-# ── constants ───────────────────────────────────────────────────────────────────────────────────────────
+# ── constants ────────────────────────────────────────────────────────────────────────────────────────────────────
 FRAME_H         = 760
 FRAME_W         = 960
 FRAME_BYTES     = FRAME_H * FRAME_W        # uint8 greyscale
@@ -90,7 +90,7 @@ CAPTURE_TIMEOUT = 8.0   # seconds
 HEALTH_POLL    = 10.0   # seconds between health checks
 RESTART_LIMIT   = 3     # max automatic restarts per worker
 
-# ── shared parameter helpers ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_param():
     """Load key=value config; return dict."""
     p = {}
@@ -112,7 +112,7 @@ def save_param(p):
         for k, v in sorted(p.items()):
             f.write('%s=%s\n' % (k, v))
 
-# ── catalogue helpers ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── catalogue helpers ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_catalogue():
     """Return list-of-dicts from Solver/catalogue.csv (ra,dec,hipId columns)."""
     cat = []
@@ -133,7 +133,7 @@ def load_catalogue():
         pass
     return cat
 
-# ── OTA update ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── OTA update ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def check_update():
     """Return (new_version_str, tarball_url) or (None, None)."""
     manifest = os.path.join(home_path, 'update_manifest.json')
@@ -155,7 +155,7 @@ def apply_update(url):
     subprocess.run(['tar', '-xzf', tmp, '-C', home_path], check=True)
     log.info('[main] OTA update applied from %s', url)
 
-# ── proc_specs restart registry ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── proc_specs restart registry ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 restart_counts = {}
 
 def _start_worker(spec, shared):
@@ -278,10 +278,29 @@ def solver_worker(
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+    from calibration import FovCalibrator
+    from polar_run import PolarAligner, PolarState
+
     shm  = shared_memory.SharedMemory(name=frame_shm_name)
     frame = np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=shm.buf)
 
     param = load_param()
+
+    # ── calibrator (FovCalibrator requires param, save_param_fn, fov_estimate, frame_width) ──
+    _calibrator = FovCalibrator(
+        param,
+        save_param,
+        float(param.get('FOV', '5.0')),
+        FRAME_W,
+    )
+
+    # ── polar aligner ──
+    _polar_lat = None
+    try:
+        _polar_lat = float(param.get('Latitude', ''))
+    except (ValueError, TypeError):
+        pass
+    _polar = PolarAligner(latitude_deg=_polar_lat)
 
     # ── solver state ──
     solved_radec   = None    # (ra_deg, dec_deg) J2000
@@ -334,7 +353,7 @@ def solver_worker(
             max_centroids   = MAX_CENTROIDS,
         )
 
-        fov_hint  = _fov_measured  # None on first solve
+        fov_hint  = _calibrator.get_fov_estimate()
         ra_hint   = dec_hint = None
         if solved_radec:
             ra_hint, dec_hint = solved_radec
@@ -362,8 +381,8 @@ def solver_worker(
                 result = solver.solve_from_centroids(
                     ext,
                     (FRAME_H, FRAME_W),
-                    fov_estimate  = float(param.get('FOV', '5.0')),
-                    fov_max_error = 0.5,
+                    fov_estimate  = _calibrator.get_fov_estimate() or float(param.get('FOV', '5.0')),
+                    fov_max_error = _calibrator.get_fov_max_error(),
                     match_threshold=1e-6,
                 )
             except Exception as e:
@@ -377,6 +396,7 @@ def solver_worker(
         dec_deg = result.dec
         if hasattr(result, 'fov'):
             _fov_measured = result.fov
+            _calibrator.update_from_solve(result.fov)
 
         # apply offset
         if offset_flag.value and (offset_cx or offset_cy):
@@ -653,14 +673,10 @@ def solver_worker(
             }
 
         elif cmd == 'calibration_status':
-            return {
-                'fov_deg':    _fov_measured,
-                'calibrated': _fov_measured is not None,
-                'state':      'calibrated' if _fov_measured else 'uncalibrated',
-            }
+            return _calibrator.get_status()
 
         elif cmd == 'calibration_reset':
-            _fov_measured = None
+            _calibrator.force_recalibrate()
             return {'reset': True}
 
         elif cmd == 'reset_offset':
@@ -700,18 +716,21 @@ def solver_worker(
             return {'ok': True}
 
         elif cmd == 'polar_start':
-            return {'active': False, 'status': 'not_implemented'}
+            _polar.start()
+            return _polar.get_status()
 
         elif cmd == 'polar_status':
-            return {'active': False, 'status': 'idle', 'error_arcsec': None}
+            return _polar.get_status()
 
         elif cmd == 'polar_cancel':
+            _polar.cancel()
             return {'ok': True}
 
         elif cmd == 'polar_set_latitude':
             lat = float(args.get('latitude_deg', 0.0))
             param['Latitude'] = str(lat)
             save_param(param)
+            _polar.set_latitude(lat)
             return {'latitude_deg': lat}
 
         else:
@@ -812,7 +831,9 @@ def solver_worker(
             frame_ready.clear()
             img = frame.copy()
             frame_n += 1
-            _do_solve(img)
+            ok = _do_solve(img)
+            if ok and _polar.state not in (PolarState.IDLE, PolarState.DONE, PolarState.ERROR):
+                _polar.update_from_solve(shared_ra.value, shared_dec.value)
         except Exception as e:
             log.warning('[solver] loop error: %s', e)
 
@@ -919,6 +940,94 @@ def lx200_worker(
         elif data == ':MS#':
             send('0')
 
+        # :GW# — mount status (required for SkySafari init handshake)
+        elif data == ':GW#':
+            send('AT2#')
+
+        # :GVP#/:GVN#/:GVF#/:GVD#/:GVT# — firmware version queries
+        elif data.startswith(':GV'):
+            send('eFinder-tetra3rs#')
+
+        # :GT# — tracking rate
+        elif data == ':GT#':
+            send('60.0#')
+
+        # :Gr# — slew rate
+        elif data == ':Gr#':
+            send('4#')
+
+        # :GA# — altitude (not tracked, return zero)
+        elif data == ':GA#':
+            send('+00*00#')
+
+        # :GZ# — azimuth
+        elif data == ':GZ#':
+            send('000*00#')
+
+        # :GC# — date
+        elif data == ':GC#':
+            t = datetime.datetime.utcnow()
+            send('%02d/%02d/%02d#' % (t.month, t.day, t.year % 100))
+
+        # :GL# — local time
+        elif data == ':GL#':
+            t = datetime.datetime.utcnow()
+            send('%02d:%02d:%02d#' % (t.hour, t.minute, t.second))
+
+        # :GG# — UTC offset
+        elif data == ':GG#':
+            send('+0.0#')
+
+        # :Gt# — site latitude (return stored value or 0)
+        elif data == ':Gt#':
+            lat = param.get('Latitude', '0.0')
+            deg = float(lat)
+            sign = '+' if deg >= 0 else '-'
+            d = abs(deg)
+            send('%s%02d*%02d#' % (sign, int(d), int((d % 1) * 60)))
+
+        # :Gg# — site longitude
+        elif data == ':Gg#':
+            lon = param.get('Longitude', '0.0')
+            deg = float(lon)
+            sign = '+' if deg >= 0 else '-'
+            d = abs(deg)
+            send('%s%03d*%02d#' % (sign, int(d), int((d % 1) * 60)))
+
+        # :St# — set site latitude
+        elif data.startswith(':St'):
+            param['Latitude'] = data[3:].rstrip('#')
+            send('1')
+
+        # :Sg# — set site longitude
+        elif data.startswith(':Sg'):
+            param['Longitude'] = data[3:].rstrip('#')
+            send('1')
+
+        # :SL# — set local time (acknowledge, ignore)
+        elif data.startswith(':SL'):
+            send('1')
+
+        # :SG# — set UTC offset (acknowledge, ignore)
+        elif data.startswith(':SG'):
+            send('1')
+
+        # :Sr# — set target RA (acknowledge)
+        elif data.startswith(':Sr'):
+            send('1')
+
+        # :Sd# — set target Dec (acknowledge)
+        elif data.startswith(':Sd'):
+            send('1')
+
+        # :MA#/:Me#/:Mw#/:Mn#/:Ms# — motion commands (no-op)
+        elif data.startswith(':M') and data != ':MS#':
+            send('')
+
+        # :Re#/:Rw#/:Rn#/:Rs# — rate commands (acknowledge)
+        elif data.startswith(':R'):
+            send('')
+
         # efinder extensions via :X<cmd> #
         elif data.startswith(':X'):
             inner = data[2:].rstrip('#').strip()
@@ -934,6 +1043,10 @@ def lx200_worker(
 
     def _client_thread(conn, addr):
         log.info('[lx200] connect %s', addr)
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         buf = ''
         try:
             while keep.value:
@@ -951,6 +1064,7 @@ def lx200_worker(
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     srv.bind((host, port))
     srv.listen(5)
     srv.settimeout(1.0)
