@@ -69,7 +69,7 @@ try:
 except ImportError:
     Picamera2 = None  # allow import for unit-testing on non-Pi hosts
 
-# ── logging ────────────────────────────────────────────────────────────────────────────
+# ── logging ────────────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level   = logging.INFO,
     format  = '%(asctime)s %(processName)-14s %(levelname)s %(message)s',
@@ -77,11 +77,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── paths ────────────────────────────────────────────────────────────────────────────
+# ── paths ────────────────────────────────────────────────────────────────────────────────────
 home_path  = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _param_path = os.path.join(home_path, 'Solver/eFinder.config')
 
-# ── constants ───────────────────────────────────────────────────────────────────────────
+# ── constants ─────────────────────────────────────────────────────────────────────────────────────
 FRAME_H         = 760
 FRAME_W         = 960
 FRAME_BYTES     = FRAME_H * FRAME_W        # uint8 greyscale
@@ -90,7 +90,7 @@ CAPTURE_TIMEOUT = 8.0   # seconds
 HEALTH_POLL    = 10.0   # seconds between health checks
 RESTART_LIMIT   = 3     # max automatic restarts per worker
 
-# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────
+# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_param():
     """Load key=value config; return dict."""
     p = {}
@@ -112,7 +112,7 @@ def save_param(p):
         for k, v in sorted(p.items()):
             f.write('%s=%s\n' % (k, v))
 
-# ── catalogue helpers ───────────────────────────────────────────────────────────────────────────
+# ── catalogue helpers ─────────────────────────────────────────────────────────────────────────────────────────────
 def load_catalogue():
     """Return list-of-dicts from Solver/catalogue.csv (ra,dec,hipId columns)."""
     cat = []
@@ -133,7 +133,7 @@ def load_catalogue():
         pass
     return cat
 
-# ── OTA update ────────────────────────────────────────────────────────────────────────────────────
+# ── OTA update ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 def check_update():
     """Return (new_version_str, tarball_url) or (None, None)."""
     manifest = os.path.join(home_path, 'update_manifest.json')
@@ -155,7 +155,7 @@ def apply_update(url):
     subprocess.run(['tar', '-xzf', tmp, '-C', home_path], check=True)
     log.info('[main] OTA update applied from %s', url)
 
-# ── proc_specs restart registry ───────────────────────────────────────────────────────────────────────────────────
+# ── proc_specs restart registry ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 restart_counts = {}
 
 def _start_worker(spec, shared):
@@ -536,16 +536,24 @@ def solver_worker(
 
         elif cmd == 'measure_offset':
             offset_flag.value = True
-            ok = _do_solve(_request_capture())
+            img = _request_capture()
+            ok = _do_solve(img)
             if not ok:
                 offset_flag.value = False; return 'fail'
-            exp = float(param.get('Exposure','0.2'))
-            while float(peak) < 200 and exp < 4.0:
+            exp = float(param.get('Exposure', '0.2'))
+            ext = tetra3rs.extract_centroids(img, sigma_threshold=_detect_sigma,
+                                             max_centroids=MAX_CENTROIDS)
+            peak = _centroid_peak(ext.centroids, img)
+            while peak < 200 and exp < 4.0:
                 exp = min(4.0, exp * 1.5)
-                _set_camera(exp, param.get('Gain','20'))
-                ok = _do_solve(_request_capture())
+                _set_camera(exp, param.get('Gain', '20'))
+                img = _request_capture()
+                ok = _do_solve(img)
                 if not ok:
                     offset_flag.value = False; return 'fail'
+                ext = tetra3rs.extract_centroids(img, sigma_threshold=_detect_sigma,
+                                                 max_centroids=MAX_CENTROIDS)
+                peak = _centroid_peak(ext.centroids, img)
             return offset_str
 
         elif cmd == 'shutdown':
@@ -604,6 +612,85 @@ def solver_worker(
         img2.save(os.path.join(home_path, 'Solver/images/capture.jpg'))
         if frame_n > 1100:
             keep.value = False
+
+    # ── maint Unix socket server thread ──
+    MAINT_SOCK_PATH = '/run/efinder/maint.sock'
+
+    def _maint_client_thread(conn):
+        """Handle one maint socket connection: read newline-delimited JSON requests."""
+        buf = b''
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b'\n' in buf:
+                    line, _, buf = buf.partition(b'\n')
+                    if not line.strip():
+                        continue
+                    try:
+                        req = json.loads(line.decode('utf-8'))
+                        cmd = str(req.get('cmd', ''))
+                        args = req.get('args') or {}
+                        a = str(args.get('a', ''))
+                        b = str(args.get('b', ''))
+                        result = _handle(cmd, a, b)
+                        resp = json.dumps({'ok': True, 'result': result, 'error': None}) + '\n'
+                    except Exception as e:
+                        resp = json.dumps({'ok': False, 'result': None, 'error': str(e)}) + '\n'
+                    try:
+                        conn.sendall(resp.encode('utf-8'))
+                    except Exception:
+                        break
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _maint_server_thread():
+        """Bind Unix socket at MAINT_SOCK_PATH and accept connections."""
+        sock_dir = os.path.dirname(MAINT_SOCK_PATH)
+        try:
+            os.makedirs(sock_dir, exist_ok=True)
+        except Exception as e:
+            log.warning('[solver] maint: could not create %s: %s', sock_dir, e)
+            return
+        try:
+            os.unlink(MAINT_SOCK_PATH)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning('[solver] maint: could not unlink stale socket: %s', e)
+        try:
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(MAINT_SOCK_PATH)
+            srv.listen(5)
+            srv.settimeout(1.0)
+            log.info('[solver] maint socket listening at %s', MAINT_SOCK_PATH)
+        except Exception as e:
+            log.error('[solver] maint: failed to bind socket: %s', e)
+            return
+        while keep.value:
+            try:
+                conn, _ = srv.accept()
+                threading.Thread(target=_maint_client_thread, args=(conn,),
+                                 daemon=True).start()
+            except socket.timeout:
+                pass
+            except Exception as e:
+                log.warning('[solver] maint accept error: %s', e)
+        try:
+            srv.close()
+            os.unlink(MAINT_SOCK_PATH)
+        except Exception:
+            pass
+
+    _maint_t = threading.Thread(target=_maint_server_thread, daemon=True)
+    _maint_t.start()
 
     # ── main solve loop ──
     log.info('[solver] started')
@@ -873,5 +960,5 @@ def main():
 
 
 if __name__ == '__main__':
-    set_start_method('fork')
+    mp.set_start_method('fork')
     main()
