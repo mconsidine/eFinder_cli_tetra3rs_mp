@@ -17,6 +17,8 @@
 #   Process 2 (solver):  tetra3rs extract + solve -> shared Values + JSON.
 #   Process 3 (lx200):   LX200/WiFi server — reads Values directly, no IPC lag.
 #
+# CPU affinity (Pi Zero 2W): 0=kernel, 1=lx200, 2=solver(tetra3rs), 3=camera
+#
 # Inter-process communication:
 #   frame_shm      — SharedMemory  (760x960 uint8, camera -> solver)
 #   frame_ready    — Event         (camera signals solver: new frame ready)
@@ -367,7 +369,7 @@ def solver_worker(
     frame = np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=shm.buf)
 
     param = load_param()
-    _pin_to_cpu(int(param.get('CpuSolver', '3')))
+    _pin_to_cpu(int(param.get('CpuSolver', '2')))
 
     # ── calibrator ──
     _calibrator = FovCalibrator(
