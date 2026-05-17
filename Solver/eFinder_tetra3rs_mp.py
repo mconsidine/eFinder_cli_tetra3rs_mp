@@ -28,7 +28,7 @@
 #   test_mode      — Value(c_bool)   lx200 sets, camera reads
 #   cmd_q          — Queue  lx200 -> solver: tuning/on-demand commands
 #   result_q       — Queue  solver -> lx200: command results
-#   cam_cmd_q      — Queue  solver -> camera: set_exp, captur
+#   cam_cmd_q      — Queue  solver -> camera: set_exp, capture_now
 #   shared_cfg     — Manager().dict() IMU state + calibration, all workers
 #
 # Coordinate system: J2000 RA/Dec throughout. LX200 protocol conversion in lx200
@@ -258,8 +258,10 @@ def _start_worker(spec, shared):
 # ───────────────────────────────────────────────────────────────────────────────────
 
 def camera_worker(
-    frame_shm_name, frame_ready, keep,
-    test_mode, cam_cmd_q,
+    frame_shm_name, frame_ready,
+    shared_ra, shared_dec, offset_flag,
+    keep, test_mode,
+    cmd_q, result_q, cam_cmd_q,
     *_extra,
 ):
     """
