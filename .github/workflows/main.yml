@@ -159,11 +159,14 @@ jobs:
           fi
 
           # -----------------------------------------------------------------------
-          # NetworkManager AP profile (pre-staged; firstboot.sh activates it)
+          # NetworkManager AP profile (pre-staged; firstboot.sh overwrites SSID)
           # -----------------------------------------------------------------------
           NM=$ROOT/etc/NetworkManager/system-connections/efinder-ap.nmconnection
           sudo cp image-config/efinder-ap.nmconnection "$NM"
           sudo chmod 600 "$NM"
+
+          # Enable SSH (belt-and-suspenders alongside the systemctl symlink)
+          sudo touch $ROOT/boot/firmware/ssh
 
           # -----------------------------------------------------------------------
           # Solver scripts, web UI, and config
@@ -257,6 +260,7 @@ jobs:
                 samba \\
                 samba-common-bin \\
                 zram-tools \\
+                openssh-server \\
                 initramfs-tools
             dpkg --configure -a || true
           "
@@ -541,6 +545,11 @@ jobs:
           USB_GADGET_SVC=$ROOT/etc/systemd/system/efinder-usb-gadget.service
           sudo cp image-config/efinder-usb-gadget.service "$USB_GADGET_SVC"
 
+          # Dedicated serial console: Restart=always keeps getty alive through
+          # reconnects; --local-line ignores USB carrier-detect signals.
+          sudo cp image-config/efinder-serial-console.service \
+              $ROOT/etc/systemd/system/efinder-serial-console.service
+
           sudo mkdir -p $ROOT/etc/modules-load.d
           sudo cp image-config/efinder-gadget.conf \
               $ROOT/etc/modules-load.d/efinder-gadget.conf
@@ -548,15 +557,6 @@ jobs:
           sudo mkdir -p $ROOT/etc/initramfs-tools
           grep -qxF "dwc2" $ROOT/etc/initramfs-tools/modules 2>/dev/null || \
               echo "dwc2" | sudo tee -a $ROOT/etc/initramfs-tools/modules > /dev/null
-
-          # Drop-in: agetty --local-line so USB ACM carrier-detect never
-          # causes immediate exit. Started by ExecStartPost on the gadget
-          # service (not via WANTS) so it only runs after /dev/ttyGS0 exists.
-          GETTY_DROP_DIR=$ROOT/etc/systemd/system/serial-getty@ttyGS0.service.d
-          sudo mkdir -p "$GETTY_DROP_DIR"
-          echo "[Service]"                                                                        | sudo tee    "$GETTY_DROP_DIR/local-line.conf" > /dev/null
-          echo "ExecStart="                                                                      | sudo tee -a "$GETTY_DROP_DIR/local-line.conf" > /dev/null
-          echo "ExecStart=-/sbin/agetty --local-line 115200 ttyGS0 vt100"                       | sudo tee -a "$GETTY_DROP_DIR/local-line.conf" > /dev/null
 
           # ------------------------------------------------------------------
           # efinder-firstboot service (runs firstboot.sh on every boot)
@@ -571,13 +571,13 @@ jobs:
 
           # ------------------------------------------------------------------
           # Enable services via symlinks
-          # serial-getty@ttyGS0 is started by efinder-usb-gadget ExecStartPost.
           # ------------------------------------------------------------------
           WANTS=$ROOT/etc/systemd/system/multi-user.target.wants
           sudo mkdir -p "$WANTS"
           for SVC in cpu-performance wifi-powersave-off efinder-update efinder \
                      efinder-webui smbd nmbd efinder-samba-firstboot \
-                     efinder-firstboot efinder-ensure-ap efinder-usb-gadget; do
+                     efinder-firstboot efinder-ensure-ap efinder-usb-gadget \
+                     efinder-serial-console; do
               sudo ln -sf /etc/systemd/system/${SVC}.service \
                   "$WANTS/${SVC}.service" 2>/dev/null || true
           done
@@ -598,6 +598,7 @@ jobs:
         run: |
           sudo chroot /mnt/pi raspi-config nonint do_i2c 0        2>/dev/null || true
           sudo chroot /mnt/pi raspi-config nonint do_serial_cons 1 2>/dev/null || true
+          sudo chroot /mnt/pi raspi-config nonint do_ssh 0         2>/dev/null || true
           sudo chroot /mnt/pi raspi-config nonint do_wifi_country US 2>/dev/null || true
 
           sudo chroot /mnt/pi apt-get purge -y \
