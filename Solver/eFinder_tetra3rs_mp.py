@@ -27,6 +27,7 @@
 #   cmd_q          — Queue  lx200 -> solver: tuning/on-demand commands
 #   result_q       — Queue  solver -> lx200: command results
 #   cam_cmd_q      — Queue  solver -> camera: set_exp, capture_now
+#   shared_cfg     — Manager().dict() IMU state + calibration, all workers
 #
 # Coordinate system: J2000 RA/Dec throughout. LX200 protocol conversion in lx200
 # worker only.
@@ -68,6 +69,14 @@ try:
     from picamera2 import Picamera2
 except ImportError:
     Picamera2 = None  # allow import for unit-testing on non-Pi hosts
+
+try:
+    from imu_math import quat_delta_rotvec as _quat_delta_rotvec
+    _IMU_MATH_OK = True
+except ImportError:
+    _IMU_MATH_OK = False
+    def _quat_delta_rotvec(q_now, q_ref):
+        return (0.0, 0.0, 0.0)
 
 # ── logging ────────────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -112,7 +121,7 @@ def save_param(p):
         for k, v in sorted(p.items()):
             f.write('%s=%s\n' % (k, v))
 
-# ── catalogue helpers ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── catalogue helpers ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_catalogue():
     """Return list-of-dicts from Solver/catalogue.csv (ra,dec,hipId columns)."""
     cat = []
@@ -132,6 +141,66 @@ def load_catalogue():
     except Exception:
         pass
     return cat
+
+
+def _imu_predict(shared_cfg):
+    """
+    Return IMU dead-reckoning (ra_deg, dec_deg) or None.
+
+    Uses the 2x3 calibration matrix built passively from consecutive
+    plate-solves.  Falls through to None whenever the IMU is absent,
+    data is stale, calibration is insufficient, or the predicted delta
+    exceeds the 5-degree safety cap.
+    """
+    if not shared_cfg.get('imu_available', False):
+        return None
+    if shared_cfg.get('imu_calib_n', 0) < 3:
+        return None
+    if shared_cfg.get('imu_calib_quality', 0.0) < 0.85:
+        return None
+
+    q_now = shared_cfg.get('imu_q')
+    imu_t = shared_cfg.get('imu_t', 0.0)
+    if q_now is None or time.monotonic() - imu_t > 2.0:
+        return None
+
+    q_ref   = shared_cfg.get('imu_ref_q')
+    ra_ref  = shared_cfg.get('imu_ref_ra_deg')
+    dec_ref = shared_cfg.get('imu_ref_dec_deg')
+    ref_t   = shared_cfg.get('imu_ref_t', 0.0)
+    if q_ref is None or ra_ref is None or time.monotonic() - ref_t > 120.0:
+        return None
+
+    C_flat = shared_cfg.get('imu_calib_C')
+    if C_flat is None or len(C_flat) != 6:
+        return None
+
+    try:
+        r = _quat_delta_rotvec(q_now, q_ref)
+    except Exception:
+        return None
+
+    c  = C_flat
+    dr = c[0]*r[0] + c[1]*r[1] + c[2]*r[2]   # camera-right
+    du = c[3]*r[0] + c[4]*r[1] + c[5]*r[2]   # camera-up
+
+    roll_ref = shared_cfg.get('imu_ref_roll_deg', 0.0)
+    roll_rad = math.radians(roll_ref)
+    cos_r, sin_r = math.cos(roll_rad), math.sin(roll_rad)
+    dra_rad  =  dr * cos_r - du * sin_r
+    ddec_rad =  dr * sin_r + du * cos_r
+
+    if abs(dra_rad) > math.radians(5.0) or abs(ddec_rad) > math.radians(5.0):
+        return None
+
+    cos_dec = math.cos(math.radians(dec_ref))
+    if abs(cos_dec) < 0.01:
+        return None  # within ~0.6 deg of a pole
+
+    ra_pred  = (ra_ref  + math.degrees(dra_rad)  / cos_dec) % 360.0
+    dec_pred = max(-90.0, min(90.0, dec_ref + math.degrees(ddec_rad)))
+    return ra_pred, dec_pred
+
 
 # ── OTA update ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def check_update():
@@ -230,7 +299,7 @@ def camera_worker(
     def _capture_frame():
         if cam:
             arr = cam.capture_array('main')
-            # YUV420 → Y plane
+            # YUV420 -> Y plane
             buf[:] = arr[:FRAME_H, :FRAME_W]
         else:
             # synthetic star field for testing
@@ -273,6 +342,7 @@ def solver_worker(
     shared_ra, shared_dec, offset_flag,
     keep, test_mode,
     cmd_q, result_q, cam_cmd_q,
+    shared_cfg,
     *_extra,
 ):
     import signal
@@ -280,6 +350,13 @@ def solver_worker(
 
     from calibration import FovCalibrator
     from polar_run import PolarAligner, PolarState
+
+    # Start IMU daemon thread (no-op if smbus2/BNO055 absent)
+    try:
+        from imu_proc import start_imu_thread
+        start_imu_thread(shared_cfg)
+    except Exception as _e:
+        log.warning('[solver] IMU thread not started: %s', _e)
 
     shm  = shared_memory.SharedMemory(name=frame_shm_name)
     frame = np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=shm.buf)
@@ -324,6 +401,37 @@ def solver_worker(
 
     # ── catalogue for seeded solve ──
     catalogue = load_catalogue()
+
+    # ── IMU calibration state (accumulates solve-pair training data) ──
+    _imu_calib_state = {
+        'pairs':     [],   # list of (rotvec_3, cam_r, cam_u)
+        'prev_q':    None,
+        'prev_ra':   None,
+        'prev_dec':  None,
+        'prev_roll': None,
+    }
+
+    def _refit_imu_calib():
+        """Least-squares fit of the 2x3 IMU->camera calibration matrix."""
+        pairs = _imu_calib_state['pairs']
+        n = len(pairs)
+        shared_cfg['imu_calib_n'] = n
+        if n < 3:
+            return
+        try:
+            X = np.array([[rv[0], rv[1], rv[2]] for rv, cr, cu in pairs])
+            Y = np.array([[cr, cu]               for rv, cr, cu in pairs])
+            C_T = np.linalg.lstsq(X, Y, rcond=None)[0]  # (3, 2)
+            C   = C_T.T                                   # (2, 3)
+            Y_pred  = X @ C_T
+            ss_res  = float(np.sum((Y - Y_pred) ** 2))
+            ss_tot  = float(np.sum((Y - Y.mean(axis=0)) ** 2))
+            quality = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
+            shared_cfg['imu_calib_C']       = C.ravel().tolist()
+            shared_cfg['imu_calib_quality'] = max(0.0, min(1.0, quality))
+            log.debug('[solver] imu calib n=%d quality=%.3f', n, quality)
+        except Exception as _e:
+            log.debug('[solver] imu refit error: %s', _e)
 
     # ── helpers ──
 
@@ -394,6 +502,7 @@ def solver_worker(
 
         ra_deg  = result.ra
         dec_deg = result.dec
+        roll_deg = getattr(result, 'roll', 0.0) or 0.0
         if hasattr(result, 'fov'):
             _fov_measured = result.fov
             _calibrator.update_from_solve(result.fov)
@@ -451,7 +560,7 @@ def solver_worker(
             'peak':     _peak,
             'matches':  _matches,
             'solve_ms': 0,
-            'roll_deg': getattr(result, 'roll', 0.0) or 0.0,
+            'roll_deg': roll_deg,
             'status':   1,
         }
         try:
@@ -459,6 +568,43 @@ def solver_worker(
                 json.dump(payload, f)
         except Exception:
             pass
+
+        # ── update IMU dead-reckoning reference and accumulate training pair ──
+        if shared_cfg.get('imu_available', False):
+            q_now = shared_cfg.get('imu_q')
+            if q_now is not None:
+                t_now = time.monotonic()
+                # Always update the reference quaternion (origin for dead-reckoning)
+                shared_cfg['imu_ref_q']        = q_now
+                shared_cfg['imu_ref_ra_deg']   = ra_deg
+                shared_cfg['imu_ref_dec_deg']  = dec_deg
+                shared_cfg['imu_ref_t']        = t_now
+                shared_cfg['imu_ref_roll_deg'] = roll_deg
+                # Accumulate a calibration training pair from the previous solve
+                if _imu_calib_state['prev_q'] is not None:
+                    try:
+                        rv = _quat_delta_rotvec(q_now, _imu_calib_state['prev_q'])
+                        dra_deg  = ((ra_deg  - _imu_calib_state['prev_ra']  + 180) % 360) - 180
+                        ddec_deg =   dec_deg - _imu_calib_state['prev_dec']
+                        # Only include pairs with sane deltas (< 10 deg)
+                        if abs(dra_deg) < 10 and abs(ddec_deg) < 10:
+                            pr       = math.radians(_imu_calib_state['prev_roll'] or 0.0)
+                            cos_dec  = math.cos(math.radians(dec_deg))
+                            dra_rad  = math.radians(dra_deg) * cos_dec  # arc-length
+                            ddec_rad = math.radians(ddec_deg)
+                            cam_r =  dra_rad * math.cos(pr) + ddec_rad * math.sin(pr)
+                            cam_u = -dra_rad * math.sin(pr) + ddec_rad * math.cos(pr)
+                            _imu_calib_state['pairs'].append((rv, cam_r, cam_u))
+                            if len(_imu_calib_state['pairs']) > 50:
+                                _imu_calib_state['pairs'].pop(0)
+                            _refit_imu_calib()
+                    except Exception as _e:
+                        log.debug('[solver] imu calib pair error: %s', _e)
+                _imu_calib_state['prev_q']    = q_now
+                _imu_calib_state['prev_ra']   = ra_deg
+                _imu_calib_state['prev_dec']  = dec_deg
+                _imu_calib_state['prev_roll'] = roll_deg
+
         return True
 
     def _set_camera(exp, gain, persist=True):
@@ -665,11 +811,20 @@ def solver_worker(
                 sol = None
             bs_x = FRAME_W / 2 + offset_cx
             bs_y = FRAME_H / 2 + offset_cy
+            imu_n       = shared_cfg.get('imu_calib_n', 0)
+            imu_quality = shared_cfg.get('imu_calib_quality', 0.0)
+            imu_avail   = shared_cfg.get('imu_available', False)
             return {
                 'solution':  sol,
                 'boresight': {'x': bs_x, 'y': bs_y},
                 'fov_deg':   _fov_measured,
                 'solving':   solve,
+                'imu': {
+                    'available': imu_avail,
+                    'calib_n':   imu_n,
+                    'quality':   round(imu_quality, 3),
+                    'active':    imu_avail and imu_n >= 3 and imu_quality >= 0.85,
+                },
             }
 
         elif cmd == 'calibration_status':
@@ -850,6 +1005,7 @@ def lx200_worker(
     shared_ra, shared_dec, offset_flag,
     keep, test_mode,
     cmd_q, result_q, cam_cmd_q,
+    shared_cfg,
     *_extra,
 ):
     import signal, socket
@@ -909,13 +1065,21 @@ def lx200_worker(
             try: conn.sendall(s.encode())
             except Exception: pass
 
-        # :GR# — get RA
+        # :GR# — get RA (IMU dead-reckoning with fallback)
         if data == ':GR#':
-            send(_ra_to_lx200(shared_ra.value) + '#')
+            pred = _imu_predict(shared_cfg)
+            if pred is not None:
+                send(_ra_to_lx200(pred[0]) + '#')
+            else:
+                send(_ra_to_lx200(shared_ra.value) + '#')
 
-        # :GD# — get Dec
+        # :GD# — get Dec (IMU dead-reckoning with fallback)
         elif data == ':GD#':
-            send(_dec_to_lx200(shared_dec.value) + '#')
+            pred = _imu_predict(shared_cfg)
+            if pred is not None:
+                send(_dec_to_lx200(pred[1]) + '#')
+            else:
+                send(_dec_to_lx200(shared_dec.value) + '#')
 
         # :GS# — get sidereal time (dummy)
         elif data == ':GS#':
@@ -1126,11 +1290,28 @@ def main():
     # event
     frame_ready = mp.Event()
 
+    # IMU shared state (manager dict — accessible from all worker processes)
+    mgr = mp.Manager()
+    shared_cfg = mgr.dict({
+        'imu_available':    False,
+        'imu_q':            None,
+        'imu_t':            0.0,
+        'imu_ref_q':        None,
+        'imu_ref_ra_deg':   None,
+        'imu_ref_dec_deg':  None,
+        'imu_ref_t':        0.0,
+        'imu_ref_roll_deg': 0.0,
+        'imu_calib_C':      None,
+        'imu_calib_n':      0,
+        'imu_calib_quality': 0.0,
+    })
+
     shared = (
         shm.name, frame_ready,
         shared_ra, shared_dec, offset_flag,
         keep, test_mode,
         cmd_q, result_q, cam_cmd_q,
+        shared_cfg,
     )
 
     proc_specs = [
@@ -1168,6 +1349,7 @@ def main():
             log.warning('[main] force-terminating %s', name)
             p.terminate()
 
+    mgr.shutdown()
     shm.unlink()
     log.info('[main] done')
 
