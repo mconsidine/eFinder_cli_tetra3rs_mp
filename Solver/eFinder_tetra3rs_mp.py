@@ -69,7 +69,7 @@ try:
 except ImportError:
     Picamera2 = None  # allow import for unit-testing on non-Pi hosts
 
-# ── logging ────────────────────────────────────────────────────────────────────────────────────
+# ── logging ──────────────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level   = logging.INFO,
     format  = '%(asctime)s %(processName)-14s %(levelname)s %(message)s',
@@ -81,7 +81,7 @@ log = logging.getLogger(__name__)
 home_path  = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _param_path = os.path.join(home_path, 'Solver/eFinder.config')
 
-# ── constants ─────────────────────────────────────────────────────────────────────────────────────
+# ── constants ───────────────────────────────────────────────────────────────────────────────────────────
 FRAME_H         = 760
 FRAME_W         = 960
 FRAME_BYTES     = FRAME_H * FRAME_W        # uint8 greyscale
@@ -90,7 +90,7 @@ CAPTURE_TIMEOUT = 8.0   # seconds
 HEALTH_POLL    = 10.0   # seconds between health checks
 RESTART_LIMIT   = 3     # max automatic restarts per worker
 
-# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── shared parameter helpers ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_param():
     """Load key=value config; return dict."""
     p = {}
@@ -112,7 +112,7 @@ def save_param(p):
         for k, v in sorted(p.items()):
             f.write('%s=%s\n' % (k, v))
 
-# ── catalogue helpers ─────────────────────────────────────────────────────────────────────────────────────────────
+# ── catalogue helpers ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def load_catalogue():
     """Return list-of-dicts from Solver/catalogue.csv (ra,dec,hipId columns)."""
     cat = []
@@ -133,7 +133,7 @@ def load_catalogue():
         pass
     return cat
 
-# ── OTA update ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── OTA update ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def check_update():
     """Return (new_version_str, tarball_url) or (None, None)."""
     manifest = os.path.join(home_path, 'update_manifest.json')
@@ -155,7 +155,7 @@ def apply_update(url):
     subprocess.run(['tar', '-xzf', tmp, '-C', home_path], check=True)
     log.info('[main] OTA update applied from %s', url)
 
-# ── proc_specs restart registry ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── proc_specs restart registry ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 restart_counts = {}
 
 def _start_worker(spec, shared):
@@ -178,9 +178,9 @@ def _start_worker(spec, shared):
     log.info('[main] started %s pid=%d', name, p.pid)
     return p
 
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 # PROCESS 1 — camera
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 
 def camera_worker(
     frame_shm_name, frame_ready, keep,
@@ -264,9 +264,9 @@ def camera_worker(
     log.info('[camera] exiting')
 
 
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 # PROCESS 2 — solver
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 
 def solver_worker(
     frame_shm_name, frame_ready,
@@ -388,6 +388,10 @@ def solver_worker(
         shared_ra.value     = ra_deg
         shared_dec.value    = dec_deg
 
+        _stars  = len(ext.centroids) if hasattr(ext, 'centroids') else 0
+        _peak   = _centroid_peak(ext.centroids, img) if hasattr(ext, 'centroids') else 0
+        _matches = getattr(result, 'matches', 0) or getattr(result, 'num_matches', 0)
+
         # ── identify nearest catalogue star ──
         name = sn = hipId = ''
         if catalogue:
@@ -422,6 +426,13 @@ def solver_worker(
             'ts':       datetime.datetime.utcnow().isoformat(),
             'offset':   offset_str,
             'fov':      round(_fov_measured, 4) if _fov_measured else None,
+            'solved':   True,
+            'stars':    _stars,
+            'peak':     _peak,
+            'matches':  _matches,
+            'solve_ms': 0,
+            'roll_deg': getattr(result, 'roll', 0.0) or 0.0,
+            'status':   1,
         }
         try:
             with open(result_path, 'w') as f:
@@ -616,8 +627,98 @@ def solver_worker(
     # ── maint Unix socket server thread ──
     MAINT_SOCK_PATH = '/run/efinder/maint.sock'
 
+    def _dispatch_maint(cmd, args):
+        """Translate webui maint commands to solver internals."""
+        nonlocal _fov_measured, solve, solved_radec
+
+        if cmd == 'ping':
+            return {'pong': True}
+
+        elif cmd == 'version':
+            return {'version': '1.0.0-tetra3rs_mp'}
+
+        elif cmd == 'status':
+            try:
+                with open(result_path) as _f:
+                    sol = json.load(_f)
+            except Exception:
+                sol = None
+            bs_x = FRAME_W / 2 + offset_cx
+            bs_y = FRAME_H / 2 + offset_cy
+            return {
+                'solution':  sol,
+                'boresight': {'x': bs_x, 'y': bs_y},
+                'fov_deg':   _fov_measured,
+                'solving':   solve,
+            }
+
+        elif cmd == 'calibration_status':
+            return {
+                'fov_deg':    _fov_measured,
+                'calibrated': _fov_measured is not None,
+                'state':      'calibrated' if _fov_measured else 'uncalibrated',
+            }
+
+        elif cmd == 'calibration_reset':
+            _fov_measured = None
+            return {'reset': True}
+
+        elif cmd == 'reset_offset':
+            return _handle('clear_offset', '', '')
+
+        elif cmd == 'boresight_show':
+            return {'x': FRAME_W / 2 + offset_cx, 'y': FRAME_H / 2 + offset_cy}
+
+        elif cmd == 'boresight_center':
+            return _handle('clear_offset', '', '')
+
+        elif cmd == 'exposure_get':
+            return {
+                'exposure_s': float(param.get('Exposure', '0.2')),
+                'gain':       float(param.get('Gain', '20')),
+            }
+
+        elif cmd == 'exposure_set':
+            s = float(args.get('exposure_s', param.get('Exposure', '0.2')))
+            persist = bool(args.get('persist', True))
+            _set_camera(s, float(param.get('Gain', '20')), persist=persist)
+            return {'exposure_s': s}
+
+        elif cmd == 'gain_set':
+            g = float(args.get('gain', param.get('Gain', '20')))
+            persist = bool(args.get('persist', True))
+            _set_camera(float(param.get('Exposure', '0.2')), g, persist=persist)
+            return {'gain': g}
+
+        elif cmd == 'solver_params_get':
+            return dict(param)
+
+        elif cmd == 'solver_params_set':
+            for k, v in args.items():
+                param[k] = str(v)
+            save_param(param)
+            return {'ok': True}
+
+        elif cmd == 'polar_start':
+            return {'active': False, 'status': 'not_implemented'}
+
+        elif cmd == 'polar_status':
+            return {'active': False, 'status': 'idle', 'error_arcsec': None}
+
+        elif cmd == 'polar_cancel':
+            return {'ok': True}
+
+        elif cmd == 'polar_set_latitude':
+            lat = float(args.get('latitude_deg', 0.0))
+            param['Latitude'] = str(lat)
+            save_param(param)
+            return {'latitude_deg': lat}
+
+        else:
+            raise ValueError('unknown maint command: %s' % cmd)
+
     def _maint_client_thread(conn):
-        """Handle one maint socket connection: read newline-delimited JSON requests."""
+        """Handle one maint connection: newline-delimited JSON in/out."""
         buf = b''
         try:
             while True:
@@ -630,15 +731,13 @@ def solver_worker(
                     if not line.strip():
                         continue
                     try:
-                        req = json.loads(line.decode('utf-8'))
-                        cmd = str(req.get('cmd', ''))
-                        args = req.get('args') or {}
-                        a = str(args.get('a', ''))
-                        b = str(args.get('b', ''))
-                        result = _handle(cmd, a, b)
-                        resp = json.dumps({'ok': True, 'result': result, 'error': None}) + '\n'
+                        req    = json.loads(line.decode('utf-8'))
+                        cmd    = str(req.get('cmd', ''))
+                        args   = req.get('args') or {}
+                        result = _dispatch_maint(cmd, args)
+                        resp   = json.dumps({'ok': True, 'result': result}) + '\n'
                     except Exception as e:
-                        resp = json.dumps({'ok': False, 'result': None, 'error': str(e)}) + '\n'
+                        resp = json.dumps({'ok': False, 'error': str(e)}) + '\n'
                     try:
                         conn.sendall(resp.encode('utf-8'))
                     except Exception:
@@ -721,9 +820,9 @@ def solver_worker(
     log.info('[solver] exiting')
 
 
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 # PROCESS 3 — lx200
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 
 def lx200_worker(
     frame_shm_name, frame_ready,
@@ -871,9 +970,9 @@ def lx200_worker(
     log.info('[lx200] exiting')
 
 
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 # PROCESS 0 — main / supervisor
-# ─────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description='eFinder tetra3rs multiprocess')
