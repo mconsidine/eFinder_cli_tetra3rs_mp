@@ -8,6 +8,8 @@ autoconnect-retries=-1
 
 [wifi]
 mode=ap
+band=bg
+channel=6
 ssid=efinder
 
 [wifi-security]
