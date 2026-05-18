@@ -187,6 +187,9 @@ jobs:
           [ -f scripts/efinder-ctl ] && sudo install -m 755 scripts/efinder-ctl \
               $ROOT/usr/local/bin/efinder-ctl
 
+          [ -f scripts/efinder-update ] && sudo install -m 755 scripts/efinder-update \
+              $ROOT/usr/local/bin/efinder-update
+
           # Stage firstboot.sh (run on every boot by efinder-firstboot.service)
           sudo install -m 755 scripts/firstboot.sh \
               $ROOT/usr/local/bin/efinder-firstboot.sh
