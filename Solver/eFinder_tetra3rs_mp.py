@@ -41,6 +41,7 @@ import time
 import csv
 import json
 import ctypes
+import threading
 from datetime import datetime
 from pathlib import Path
 from multiprocessing import (
@@ -345,7 +346,8 @@ def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                    lx200_cmd_q, lx200_result_q,
                    shared_ra, shared_dec, offset_flag, test_mode,
-                   latest_slot, frame_seq):
+                   latest_slot, frame_seq,
+                   maint_cmd_q=None, maint_result_q=None):
     """
     Owns tetra3rs database.
     Continuous loop: wait for frame -> solve -> update shared_ra/shared_dec.
@@ -363,7 +365,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageOps
 
     param = load_param()
-    coordinates = Coordinates()
+    _sigma_threshold = float(param.get('sigma_threshold', '10.0'))
 
     # Attach to all three SHM slots — we pick which one to copy from at
     # each iteration based on latest_slot's value.
@@ -715,7 +717,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         # centroids already in centred pixel space, brightest first.
         extraction = tetra3rs.extract_centroids(
             np_img,
-            sigma_threshold=10.0,
+            sigma_threshold=_sigma_threshold,
             max_centroids=MAX_CENTROIDS,
         )
         centroid_list = extraction.centroids
@@ -1025,9 +1027,65 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         return 'ok'
 
+    def _handle_maint_cmd(mc, ma):
+        nonlocal _sigma_threshold, _fov_measured
+        if mc == 'maint_get_exp':
+            return {'ok': True, 'result': {
+                'exposure': float(param.get('Exposure', '0.2')),
+                'gain': float(param.get('Gain', '20')),
+            }}
+        if mc == 'maint_set_exp':
+            exp  = float(ma.get('exposure', param.get('Exposure', '0.2')))
+            gain = float(ma.get('gain', param.get('Gain', '20')))
+            _set_camera(exp, gain)
+            return {'ok': True, 'result': {}}
+        if mc == 'maint_set_gain':
+            gain = float(ma.get('gain', param.get('Gain', '20')))
+            _set_camera(param.get('Exposure', '0.2'), gain)
+            return {'ok': True, 'result': {}}
+        if mc == 'maint_calibration_status':
+            n = len(_fov_samples)
+            if _fov_measured > 0 and n >= _FOV_MIN:
+                status = 'CALIBRATED'
+            elif n > 0:
+                status = 'CALIBRATING'
+            else:
+                status = 'UNCALIBRATED'
+            return {'ok': True, 'result': {
+                'status': status,
+                'samples': n,
+                'fov_measured': round(_fov_measured, 4) if _fov_measured > 0 else None,
+            }}
+        if mc == 'maint_calibration_reset':
+            _fov_samples.clear()
+            _fov_measured = 0.0
+            param['fov_measured'] = '0'
+            save_param(param)
+            return {'ok': True, 'result': {}}
+        if mc == 'maint_get_sigma':
+            return {'ok': True, 'result': {'sigma_threshold': _sigma_threshold}}
+        if mc == 'maint_set_sigma':
+            _sigma_threshold = float(ma.get('sigma_threshold', _sigma_threshold))
+            param['sigma_threshold'] = str(_sigma_threshold)
+            save_param(param)
+            return {'ok': True, 'result': {'sigma_threshold': _sigma_threshold}}
+        if mc == 'maint_reset_offset':
+            _handle('reset_offset', None, None)
+            return {'ok': True, 'result': {}}
+        return {'ok': False, 'error': 'unknown maint cmd: %s' % mc}
+
     print('[solver] ready, entering main loop')
 
     while True:
+        # drain maint commands
+        if maint_cmd_q is not None:
+            try:
+                while True:
+                    mc, ma = maint_cmd_q.get_nowait()
+                    maint_result_q.put(_handle_maint_cmd(mc, ma))
+            except Exception:
+                pass
+
         # drain on-demand commands first
         try:
             while True:
@@ -1085,12 +1143,14 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 # PROCESS 3 - LX200 / WiFi server
 # ===========================================================================
 def lx200_process(lx200_cmd_q, lx200_result_q,
-                  shared_ra, shared_dec, offset_flag, test_mode):
+                  shared_ra, shared_dec, offset_flag, test_mode,
+                  maint_cmd_q=None, maint_result_q=None):
     """
     Serves SkySafari on port 4060.
     Reads ra/dec directly from shared Values - no IPC latency on hot path.
     Reads other telemetry from /dev/shm/efinder_state.json (non-critical path).
     Sends tuning/on-demand commands to solver via lx200_cmd_q.
+    Also serves maintenance socket at /run/efinder/maint.sock for Flask webui.
     """
     _pin_cpu('lx200')
     coordinates = Coordinates()
@@ -1110,6 +1170,127 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
             return str(result)
         except Exception:
             return 'err'
+
+    MAINT_SOCK_PATH = '/run/efinder/maint.sock'
+
+    def _maint_solver_cmd(mc, ma, timeout=10.0):
+        if maint_cmd_q is None:
+            return {'ok': False, 'error': 'maint queues not available'}
+        maint_cmd_q.put((mc, ma))
+        try:
+            return maint_result_q.get(timeout=timeout)
+        except Exception:
+            return {'ok': False, 'error': 'solver timeout'}
+
+    def _dispatch_maint(cmd, args):
+        import json as _json
+        if cmd == 'ping':
+            return {'ok': True, 'result': {'pong': True}}
+        if cmd == 'status':
+            try:
+                ra  = float(shared_ra.value)
+                dec = float(shared_dec.value)
+                try:
+                    with open(STATE_FILE) as _f:
+                        _st = _json.load(_f)
+                except Exception:
+                    _st = {}
+                try:
+                    _p  = load_param()
+                    _dx = float(_p.get('d_x', '0')) / 60.0
+                    _dy = float(_p.get('d_y', '0')) / 60.0
+                    _cx, _cy = dxdy2centred(_dx, _dy)
+                    boresight = {'x': int(CENTRE_X + _cx), 'y': int(CENTRE_Y + _cy)}
+                except Exception:
+                    boresight = {'x': int(CENTRE_X), 'y': int(CENTRE_Y)}
+                return {'ok': True, 'result': {
+                    'ra':           coordinates.hh2dms(ra / 15.0),
+                    'dec':          coordinates.dd2aligndms(dec),
+                    'ra_deg':       ra,
+                    'dec_deg':      dec,
+                    'solve_status': _st.get('solve_status', 'Unknown'),
+                    'stars':        _st.get('stars', '0'),
+                    'peak':         _st.get('peak', '0'),
+                    'exposure':     _st.get('exposure', '?'),
+                    'gain':         _st.get('gain', '?'),
+                    'solve_time':   _st.get('solve_time', '0'),
+                    'fov_measured': _st.get('fov_measured'),
+                    'cpu_temp':     _st.get('cpu_temp', 0),
+                    'memory_usage': _st.get('memory_usage', 0),
+                    'version':      _st.get('version', ''),
+                    'boresight':    boresight,
+                }}
+            except Exception as _e:
+                return {'ok': False, 'error': str(_e)}
+        if cmd == 'boresight_center':
+            return _maint_solver_cmd('maint_reset_offset', {})
+        if cmd in ('polar_start', 'polar_status', 'polar_cancel', 'polar_set_latitude'):
+            return {'ok': False, 'error': 'polar alignment not supported in tetra3rs variant'}
+        if cmd == 'calibration_status':
+            return _maint_solver_cmd('maint_calibration_status', {})
+        if cmd == 'calibration_reset':
+            return _maint_solver_cmd('maint_calibration_reset', {})
+        if cmd == 'exposure_get':
+            return _maint_solver_cmd('maint_get_exp', {})
+        if cmd == 'exposure_set':
+            return _maint_solver_cmd('maint_set_exp', args)
+        if cmd == 'gain_set':
+            return _maint_solver_cmd('maint_set_gain', args)
+        if cmd == 'solver_params_get':
+            return _maint_solver_cmd('maint_get_sigma', {})
+        if cmd == 'solver_params_set':
+            return _maint_solver_cmd('maint_set_sigma', args)
+        return {'ok': False, 'error': 'unknown command: %s' % cmd}
+
+    def _handle_maint_client(conn):
+        import json as _json
+        try:
+            with conn.makefile('rb') as rfile:
+                for raw in rfile:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj  = _json.loads(raw)
+                        cmd  = obj.get('cmd', '')
+                        args = obj.get('args', {})
+                        resp = _dispatch_maint(cmd, args)
+                    except Exception as _e:
+                        resp = {'ok': False, 'error': str(_e)}
+                    try:
+                        conn.sendall((_json.dumps(resp) + '\n').encode('utf-8'))
+                    except Exception:
+                        break
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _serve_maint_socket():
+        import socket as _socket, os as _os
+        _os.makedirs(_os.path.dirname(MAINT_SOCK_PATH), exist_ok=True)
+        try:
+            _os.unlink(MAINT_SOCK_PATH)
+        except FileNotFoundError:
+            pass
+        srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        srv.bind(MAINT_SOCK_PATH)
+        _os.chmod(MAINT_SOCK_PATH, 0o666)
+        srv.listen(5)
+        print('[lx200] maint socket listening at', MAINT_SOCK_PATH)
+        while True:
+            try:
+                conn, _ = srv.accept()
+                threading.Thread(target=_handle_maint_client, args=(conn,),
+                                 daemon=True).start()
+            except Exception as _e:
+                print('[lx200] maint accept error:', _e)
+
+    threading.Thread(target=_serve_maint_socket, daemon=True,
+                     name='eFinder-maint').start()
 
     print('[lx200] starting on port 4060')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1308,6 +1489,8 @@ def main():
     cam_result_q   = Queue()
     lx200_cmd_q    = Queue()
     lx200_result_q = Queue()
+    maint_cmd_q    = Queue()
+    maint_result_q = Queue()
 
     # Store target/args alongside each Process so the restart logic can
     # reconstruct them without relying on private _target/_args attributes.
@@ -1321,11 +1504,13 @@ def main():
             args=(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                   lx200_cmd_q, lx200_result_q,
                   shared_ra, shared_dec, offset_flag, test_mode,
-                  latest_slot, frame_seq)),
+                  latest_slot, frame_seq,
+                  maint_cmd_q, maint_result_q)),
         'lx200': dict(
             target=lx200_process,
             args=(lx200_cmd_q, lx200_result_q,
-                  shared_ra, shared_dec, offset_flag, test_mode)),
+                  shared_ra, shared_dec, offset_flag, test_mode,
+                  maint_cmd_q, maint_result_q)),
     }
 
     procs = {}

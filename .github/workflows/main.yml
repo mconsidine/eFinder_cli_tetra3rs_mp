@@ -257,9 +257,6 @@ jobs:
                 i2c-tools \\
                 libi2c-dev \\
                 python3-smbus \\
-                apache2 \\
-                php \\
-                libapache2-mod-php \\
                 samba \\
                 samba-common-bin \\
                 zram-tools \\
@@ -315,21 +312,10 @@ jobs:
           sudo chroot /mnt/pi update-initramfs -u -k all || \
               echo "WARNING: update-initramfs failed (non-fatal)"
 
-      - name: Configure Apache for optional use
+      - name: Configure Samba
         run: |
-          sudo chroot /mnt/pi a2enmod rewrite
-          sudo chroot /mnt/pi a2enmod php8.2 2>/dev/null || \
-              sudo chroot /mnt/pi a2enmod php   2>/dev/null || true
-
           SAMBA_CONF=$ROOT/etc/samba/smb.conf
           sudo tee -a "$SAMBA_CONF" > /dev/null < image-config/efinder-samba.conf
-
-          APACHE_CONF=$ROOT/etc/apache2/sites-available/efinder.conf
-          sudo cp image-config/efinder-apache.conf "$APACHE_CONF"
-
-          sudo chroot /mnt/pi a2ensite efinder
-          sudo chroot /mnt/pi a2dissite 000-default || true
-          sudo chroot /mnt/pi usermod -aG efinder www-data || true
 
       - name: Write system scripts and services (outside chroot)
         run: |
