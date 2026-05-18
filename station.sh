@@ -1,93 +1,178 @@
 #!/bin/bash
-# station.sh -- connect to external WiFi (station mode)
-# Usage: ~/station.sh [ssid] [password]
-# Run ~/ap.sh to return to AP mode after install.
-set -e
+# Switch the eFinder's Wi-Fi from access-point mode to station (client) mode.
+#
+# Usage:
+#   sudo station.sh                     # scan for networks and choose interactively
+#   sudo station.sh "SSID" "Password"  # non-interactive (scripted)
+#
+# After this script:
+#   * The Pi joins the named Wi-Fi network as a client.
+#   * The 'efinder-ap' profile is deactivated (but kept; you can switch
+#     back with sudo ~/ap.sh).
+#   * The Pi gets an IP from your router's DHCP. mDNS still advertises
+#     efinder.local, so 'ssh efinder@efinder.local' should work after
+#     ~10 seconds.
+#
+# Tip: run this over the USB serial console (screen /dev/ttyACM0 115200)
+# rather than over Wi-Fi -- the USB serial link stays up while Wi-Fi
+# switches, so you won't lose your shell if the connection takes a moment.
 
-echo "Initialising WiFi radio..."
+set -euo pipefail
 
-# Unblock WiFi radio -- required on fresh Bookworm images
-sudo rfkill unblock wifi
-for f in /var/lib/systemd/rfkill/*:wlan; do
-    [ -f "$f" ] && echo 0 | sudo tee "$f" > /dev/null
-done
-
-# Set WiFi country code if somehow not already set (should be US from image).
-CURRENT_COUNTRY=$(iw reg get 2>/dev/null | grep -oP '(?<=country )\w+' | head -1)
-if [ "$CURRENT_COUNTRY" = "00" ] || [ -z "$CURRENT_COUNTRY" ]; then
-    echo "  WiFi country code not set -- setting to US."
-    sudo raspi-config nonint do_wifi_country US 2>/dev/null || true
-    echo "  If WiFi still does not work, reboot and try again."
+if [ "$EUID" -ne 0 ]; then
+  echo "ERROR: must run as root (try: sudo $0 ...)" >&2
+  exit 1
 fi
 
-# Restart NetworkManager so it picks up the unblocked radio
-sudo systemctl restart NetworkManager
-sleep 3
+# ---- Interactive SSID discovery when no arguments are supplied ---------------
+if [ $# -eq 0 ]; then
+  echo "Scanning for Wi-Fi networks..."
+  # Make sure the radio is on so nmcli can scan.
+  nmcli radio wifi on 2>/dev/null || true
+  sleep 2
 
-# Confirm wlan0 is present
-if ! ip link show wlan0 &>/dev/null; then
-    echo "ERROR: wlan0 not found after radio unblock."
-    echo "       Try rebooting: sudo reboot"
+  # Collect unique SSIDs (non-empty, exclude our own AP).
+  mapfile -t SSIDS < <(
+    nmcli -t -f SSID,SIGNAL dev wifi list 2>/dev/null \
+      | grep -v '^efinder-' \
+      | grep -v '^:' \
+      | grep -v '^$' \
+      | sort -t: -k2 -rn \
+      | awk -F: '!seen[$1]++ && $1!=""  {print $1}' \
+  )
+
+  if [ ${#SSIDS[@]} -eq 0 ]; then
+    echo "No networks found. Make sure Wi-Fi is unblocked and try again." >&2
     exit 1
-fi
+  fi
 
-echo "WiFi radio ready (country: $(iw reg get 2>/dev/null | grep -oP '(?<=country )\w+' | head -1))"
-echo ""
+  echo ""
+  echo "Available networks:"
+  for i in "${!SSIDS[@]}"; do
+    printf "  %2d) %s\n" $((i+1)) "${SSIDS[$i]}"
+  done
+  echo ""
+  read -rp "Select network [1-${#SSIDS[@]}]: " SEL
+  if ! [[ "$SEL" =~ ^[0-9]+$ ]] || [ "$SEL" -lt 1 ] || [ "$SEL" -gt ${#SSIDS[@]} ]; then
+    echo "Invalid selection." >&2
+    exit 1
+  fi
+  NEW_SSID="${SSIDS[$((SEL-1))]}"
 
-if [ -z "$1" ]; then
-    echo "Scanning for WiFi networks..."
-    nmcli device wifi rescan 2>/dev/null || true
-    sleep 2
-    echo ""
-    echo "Available networks:"
-    nmcli -f SSID,SIGNAL,SECURITY device wifi list | head -20
-    echo ""
-    read -rp "Enter SSID: " SSID
-    read -rsp "Enter password (blank for open): " PASSWORD
-    echo ""
+  read -rsp "Password for '$NEW_SSID' (Enter for open network): " NEW_PASS
+  echo ""
+
+elif [ $# -eq 2 ]; then
+  NEW_SSID="$1"
+  NEW_PASS="$2"
 else
-    SSID="$1"
-    PASSWORD="${2:-}"
+  cat <<EOF >&2
+Usage:
+  sudo station.sh                     # scan and choose interactively
+  sudo station.sh "SSID" "Password"  # non-interactive
+
+To switch back to AP mode:
+  sudo ~/ap.sh
+EOF
+  exit 1
 fi
 
-[ -z "$SSID" ] && { echo "ERROR: SSID cannot be empty"; exit 1; }
+PROFILE="efinder-station"
 
-echo "Connecting to: $SSID"
+# WPA2 requires 8+ chars; empty is allowed (open network).
+if [ -n "$NEW_PASS" ] && [ ${#NEW_PASS} -lt 8 ]; then
+  echo "ERROR: WPA2 password must be 8+ characters (or empty for open network)." >&2
+  exit 1
+fi
 
-if [ -n "$PASSWORD" ]; then
-    sudo nmcli device wifi connect "$SSID" password "$PASSWORD" || {
-        echo "Connection failed. Check SSID and password."
-        exit 1
-    }
+# Take down the AP if it's active. Allow failure -- it might already be down.
+ACTIVE_WIFI=$(nmcli -t -f NAME,DEVICE con show --active | awk -F: '$2=="wlan0"{print $1}')
+if [ -n "$ACTIVE_WIFI" ]; then
+  echo "Deactivating $ACTIVE_WIFI"
+  nmcli con down "$ACTIVE_WIFI" >/dev/null 2>&1 || true
+fi
+
+# Create or update the station connection.
+if ! nmcli -t -f NAME con show | grep -qx "$PROFILE"; then
+  echo "Creating station profile: SSID=$NEW_SSID"
+  if [ -n "$NEW_PASS" ]; then
+    nmcli con add \
+      type wifi \
+      ifname wlan0 \
+      con-name "$PROFILE" \
+      autoconnect yes \
+      ssid "$NEW_SSID" \
+      wifi-sec.key-mgmt wpa-psk \
+      wifi-sec.psk "$NEW_PASS"
+  else
+    nmcli con add \
+      type wifi \
+      ifname wlan0 \
+      con-name "$PROFILE" \
+      autoconnect yes \
+      ssid "$NEW_SSID"
+  fi
 else
-    sudo nmcli device wifi connect "$SSID" || {
-        echo "Connection failed."
-        exit 1
-    }
+  echo "Updating station profile: SSID=$NEW_SSID"
+  nmcli con modify "$PROFILE" \
+    802-11-wireless.ssid "$NEW_SSID" \
+    autoconnect yes
+  if [ -n "$NEW_PASS" ]; then
+    nmcli con modify "$PROFILE" \
+      wifi-sec.key-mgmt wpa-psk \
+      wifi-sec.psk "$NEW_PASS"
+  else
+    nmcli con modify "$PROFILE" \
+      wifi-sec.key-mgmt "" \
+      wifi-sec.psk "" 2>/dev/null || true
+  fi
 fi
 
-# Wait for IP (up to 15 s)
-echo "Waiting for IP address..."
-IP=""
-for i in $(seq 1 15); do
-    IP=$(ip -4 addr show wlan0 | grep -oP '(?<=inet )[\d.]+' | head -1)
-    [ -n "$IP" ] && break
-    sleep 1
+# Demote AP to manual-only so it doesn't auto-grab the radio at next boot.
+if nmcli -t -f NAME con show | grep -qx "efinder-ap"; then
+  nmcli con modify "efinder-ap" autoconnect no
+fi
+
+# Activate.
+echo "Connecting to '$NEW_SSID'..."
+if ! nmcli con up "$PROFILE"; then
+  echo "" >&2
+  echo "ERROR: Could not connect to '$NEW_SSID'." >&2
+  echo "Possible reasons:" >&2
+  echo "  - Wrong password" >&2
+  echo "  - Wrong SSID (case matters)" >&2
+  echo "  - Network out of range" >&2
+  echo "  - Network requires more than WPA2-PSK auth" >&2
+  echo "" >&2
+  echo "Returning to AP mode so you can reconnect and try again..." >&2
+  nmcli con modify "efinder-ap" autoconnect yes 2>/dev/null || true
+  nmcli con up efinder-ap >/dev/null 2>&1 || true
+  exit 1
+fi
+
+# Wait briefly for an IP to land.
+echo "Waiting for IP..."
+for i in $(seq 1 20); do
+  IP=$(ip -4 addr show wlan0 2>/dev/null | awk '/inet / {print $2; exit}')
+  if [ -n "$IP" ]; then break; fi
+  sleep 0.5
 done
-[ -z "$IP" ] && IP=$(hostname -I | awk '{print $1}')
 
-# Don't let the new station profile compete with AP on next boot, and clear
-# any NM "autoconnect-blocked" runtime flag on the AP profile so the Pi will
-# come back up as a hotspot after we power-cycle. The autoconnect-retries=0
-# write is what actually clears the blocked flag in NM.
-sudo nmcli con mod "$SSID" connection.autoconnect no 2>/dev/null || true
-sudo nmcli con mod efinder-ap connection.autoconnect yes \
-    connection.autoconnect-retries 0 2>/dev/null || true
+cat <<EOF
 
-echo ""
-echo "Connected to : $SSID"
-echo "IP Address   : $IP"
-echo "Hostname     : efinder.local"
-echo ""
-echo "You can now run: sudo bash ~/install.sh"
-echo "Run ~/ap.sh to return to AP mode."
+eFinder Wi-Fi is now in STATION mode.
+
+  Network: $NEW_SSID
+  IP:      ${IP:-(none yet -- check 'ip -4 addr show wlan0')}
+
+Other devices on the same network can reach the eFinder at:
+  ssh efinder@efinder.local
+or directly at the IP above.
+
+The USB serial console (screen /dev/ttyACM0 115200) is still available
+if you need to make further changes or switch back to AP mode.
+
+To return to AP mode later:
+  sudo ~/ap.sh
+
+EOF
