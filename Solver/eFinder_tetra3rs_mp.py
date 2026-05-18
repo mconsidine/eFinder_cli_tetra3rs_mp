@@ -824,7 +824,7 @@ def solver_worker(
     _live_q    = None
     _live_t    = None
     _QueueFull = None
-    LIVE_IMAGE = os.path.join(home_path, 'Solver/images/live.jpg')
+    LIVE_IMAGE = '/dev/shm/efinder_live.jpg'
     fnt        = None
     try:
         from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
@@ -1188,8 +1188,14 @@ def lx200_worker(
                 return
             time_str = utc_dt.strftime('%Y-%m-%d %H:%M:%S')
             log.info('[lx200] clock drift %.0fs — syncing to %s UTC', diff_s, time_str)
+            subprocess.run(['sudo', 'timedatectl', 'set-ntp', 'false'],
+                           capture_output=True, timeout=5)
             subprocess.run(['sudo', 'date', '-s', time_str],
                            capture_output=True, timeout=10)
+            subprocess.run(['sudo', 'hwclock', '-w'],
+                           capture_output=True, timeout=5)
+            subprocess.run(['sudo', 'timedatectl', 'set-ntp', 'true'],
+                           capture_output=True, timeout=5)
         except Exception as _e:
             log.warning('[lx200] clock sync error: %s', _e)
 
@@ -1365,7 +1371,7 @@ def lx200_worker(
                 threading.Thread(target=_sync_clock,
                                  args=(sl_val, sg_val, sc_val),
                                  daemon=True).start()
-            send('1Updating        #')
+            send('1Updating Planetary Data#                              #')
 
         # :Sr# — set target RA (parse and store for :CM# alignment)
         elif data.startswith(':Sr'):
