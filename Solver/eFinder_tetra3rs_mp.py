@@ -176,24 +176,11 @@ def centred2dxdy(cx, cy):
 # ---------------------------------------------------------------------------
 # CPU affinity helper (item 5)
 # ---------------------------------------------------------------------------
-# The Pi Zero 2W has 4x Cortex-A53. We pin each worker to specific cores
-# to keep the solver's hot numeric loop from being interrupted by camera
-# DMA completion handling or by SkySafari socket traffic, and to give the
-# solver's two background threads (state writer, live JPEG renderer) room
-# to run without stealing cycles from the main solve loop.
-#
-# Mapping (see CPU_PINNING dict). Tuneable if field measurements suggest
-# a different assignment works better.
-#
-# sched_setaffinity can fail on restricted kernels, inside containers, or
-# when systemd CPUAffinity= is already set; we log and carry on. Losing
-# the tuning doesn't break correctness.
-
 CPU_PINNING = {
-    'main':   {0},      # supervisor — idle most of the time
-    'camera': {0},      # light work, shares with USB/SDIO IRQs
-    'lx200':  {1},      # isolated from solver so replies never queue
-    'solver': {2, 3},   # heavy: main loop + state thread + live-jpeg thread
+    'main':   {0},
+    'camera': {0},
+    'lx200':  {1},
+    'solver': {2, 3},
 }
 
 def _pin_cpu(label):
@@ -202,9 +189,6 @@ def _pin_cpu(label):
     if not cores:
         return
     try:
-        # Verify requested cores actually exist on this box. On non-Pi
-        # hardware or odd kernels we just log and skip rather than pin
-        # to a phantom core.
         avail = os.sched_getaffinity(0)
         want  = cores & avail
         if not want:
@@ -212,7 +196,6 @@ def _pin_cpu(label):
                   (label, sorted(cores), sorted(avail)))
             return
         os.sched_setaffinity(0, want)
-        # Read back what actually stuck (cgroups can narrow the set).
         got = os.sched_getaffinity(0)
         if got == want:
             print('[%s] cpu pin: cores %s' % (label, sorted(got)))
@@ -220,8 +203,6 @@ def _pin_cpu(label):
             print('[%s] cpu pin partial: asked %s, got %s' %
                   (label, sorted(want), sorted(got)))
     except (OSError, AttributeError) as e:
-        # AttributeError handles the unlikely case of a Python build
-        # without sched_setaffinity (not Linux, not CPython on Linux, etc.)
         print('[%s] cpu pin not supported: %s' % (label, e))
 
 # ===========================================================================
@@ -233,24 +214,12 @@ def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     Owns Picamera2. Rotates writes across three SharedMemory slots so the
     solver can read the most-recently-published slot without racing the
     writer. Publishes (latest_slot, frame_seq) atomically after each write.
-
-    shm_names   : list of 3 SharedMemory names (created by main)
-    frame_ready : Event — set after each completed publish
-    latest_slot : Value(c_int)  — index (0/1/2) of last fully-written slot
-    frame_seq   : Value(c_uint64) — monotonic frame counter
-
-    Commands on cam_cmd_q:
-        ('set_exp', exposure, gain)
-        ('capture_once', None, None)  -> puts ('frame', array) on cam_result_q
-        ('stop', None, None)
     """
     _pin_cpu('camera')
     from picamera2 import Picamera2
 
     param = load_param()
 
-    # Attach to all three SHM slots; wrap each as a numpy view so np.copyto
-    # writes straight into shared memory with no intermediate allocation.
     shms      = [shared_memory.SharedMemory(name=n) for n in shm_names]
     slot_bufs = [np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=s.buf)
                  for s in shms]
@@ -290,24 +259,13 @@ def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         return arr[0:FRAME_H, 0:FRAME_W]
 
     def _pick_write_slot(last_published):
-        """
-        Return a slot index that the solver is guaranteed not to be reading
-        right now. With 3 slots and the solver always reading whichever slot
-        was most recently published, we just pick any slot other than the
-        published one. We prefer to rotate so we don't write to the same
-        slot twice in a row — gives the solver a full extra cycle of
-        read-safety headroom if it gets preempted mid-copy.
-        """
-        # Rotate: (published + 1) mod N. The solver may still be reading
-        # `published` but not this next slot.
         return (last_published + 1) % N_FRAME_SLOTS
 
-    last_published = -1   # sentinel: first pick goes to slot 0
+    last_published = -1
 
     print('[camera] ready (triple-buffered)')
 
     while True:
-        # drain on-demand commands
         try:
             while True:
                 cmd, a, b = cam_cmd_q.get_nowait()
@@ -322,15 +280,10 @@ def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         except Exception:
             pass
 
-        # continuous capture into the next rotation slot
         write_idx = _pick_write_slot(last_published)
         arr = _capture()
         np.copyto(slot_bufs[write_idx], arr)
 
-        # Publish: update latest_slot and bump frame_seq. The order matters:
-        # incrementing the sequence *after* updating the slot index means
-        # the solver's "read seq, copy, re-read seq" consistency check will
-        # correctly detect a mid-copy write.
         with latest_slot.get_lock():
             latest_slot.value = write_idx
         with frame_seq.get_lock():
@@ -352,10 +305,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     Owns tetra3rs database.
     Continuous loop: wait for frame -> solve -> update shared_ra/shared_dec.
     Also handles on-demand commands from lx200_cmd_q.
-
-    Reads frames from one of three SHM slots; `latest_slot` tells which
-    slot is current, `frame_seq` is the monotonic frame number. We track
-    `last_solved_seq` so we never redundantly solve the same frame.
     """
     _pin_cpu('solver')
     import tetra3rs
@@ -367,30 +316,26 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     param = load_param()
     _sigma_threshold = float(param.get('sigma_threshold', '10.0'))
 
-    # Attach to all three SHM slots — we pick which one to copy from at
-    # each iteration based on latest_slot's value.
     shms      = [shared_memory.SharedMemory(name=n) for n in shm_names]
     slot_bufs = [np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=s.buf)
                  for s in shms]
 
-    # Track last solved frame sequence so we don't re-solve the same frame
-    # if the main loop wakes up more often than the camera publishes.
     last_solved_seq = 0
 
     # --- load database ---
-    DB_PATH = os.path.join(home_path, 'Solver/efinder-tetra-database.bin')
-    print('[solver] loading tetra3rs database...')
+    DB_PATH = os.path.join(home_path, param.get('db_path', 'Solver/tetra3_index_1.6_0.4.bin'))
+    print('[solver] loading tetra3rs database:', DB_PATH)
+    if not os.path.exists(DB_PATH):
+        print('[solver] ERROR: database not found:', DB_PATH)
+        print('[solver] Files in Solver/:', os.listdir(os.path.join(home_path, 'Solver')))
+        raise FileNotFoundError(DB_PATH)
     db = tetra3rs.SolverDatabase.load_from_file(DB_PATH)
     print('[solver] tetra3rs ready  stars=%d  patterns=%d  max_fov=%.1f°' % (
         db.num_stars, db.num_patterns, db.max_fov_deg))
 
-    # --- prewarm (item 9) ---
-    # Force Rust-side scratch buffer allocation before the first real frame.
-    # Synthesise a tiny list of centroids; we don't care if the solve itself
-    # succeeds, only that the extraction/solve code paths have been exercised.
+    # --- prewarm ---
     try:
         _prewarm_img = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)
-        # A handful of bright pixels so extract_centroids has something to find.
         for (y, x) in [(100, 120), (200, 300), (300, 500), (400, 200),
                        (500, 700), (600, 400), (250, 800), (350, 600)]:
             _prewarm_img[y-1:y+2, x-1:x+2] = 255
@@ -403,7 +348,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                                     image_shape=(FRAME_H, FRAME_W),
                                     solve_timeout_ms=500)
         except Exception:
-            pass   # a failed synthetic solve still allocates scratch
+            pass
         del _prewarm_img, _ext
         print('[solver] prewarm complete')
     except Exception as e:
@@ -414,7 +359,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     except Exception:
         fnt = ImageFont.load_default()
 
-    # --- frame saving flags (for bench-test capture) ---
+    # --- frame saving flags ---
     _save_solved_frames = param.get('save_solved_frames', 'false').lower() == 'true'
     _save_failed_frames = param.get('save_failed_frames', 'false').lower() == 'true'
     _failed_frames_dir = param.get('failed_frames_dir',
@@ -454,34 +399,21 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             save_param(param)
             print('[solver] FOV calibrated: %.3f deg' % avg)
 
-    # --- offset in centred pixel space (tetra3rs convention) ---
-    # d_x / d_y stored as arcminutes in config (on-sky).
     def _build_offset():
         dx_deg = float(param.get("d_x", "0")) / 60.0
         dy_deg = float(param.get("d_y", "0")) / 60.0
-        return dxdy2centred(dx_deg, dy_deg)   # (cx, cy) centred pixels
+        return dxdy2centred(dx_deg, dy_deg)
 
     offset_cx, offset_cy = _build_offset()
 
     MAX_CENTROIDS          = 20
     SEEDED_TIMEOUT_MS      = 2000
     BLIND_TIMEOUT_MS       = 5000
-    RESEED_TOLERANCE_DEG   = 4.0   # how close a new solve must be to trust the seed
+    RESEED_TOLERANCE_DEG   = 4.0
 
     # --- Centroid peak-value attribute probe ---
-    # Documented attribute on tetra3rs Centroid: `brightness` (integrated
-    # intensity above background). Earlier experimental bindings exposed
-    # it under other names; we probe a short list so the code works across
-    # versions. Note: `brightness` / `mass` are INTEGRATED intensity, not
-    # peak. `img_peak` in _do_solve uses the windowed np.max path instead,
-    # which is the correct 0-255 peak. This attribute is only the fallback
-    # when an image isn't passed to _centroid_peak.
     _PEAK_ATTR = None
     try:
-        # Synthetic image with a few bright patches so extract_centroids
-        # reliably returns at least one Centroid. Use 3x3 blocks rather
-        # than single pixels — some centroid extractors require a local
-        # neighborhood above threshold, not just one hot pixel.
         _probe_img = np.zeros((40, 40), dtype=np.uint8)
         for (_y, _x) in [(10, 10), (20, 30), (30, 15)]:
             _probe_img[_y-1:_y+2, _x-1:_x+2] = 255
@@ -501,28 +433,10 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         print('[solver] centroid peak probe failed:', _e)
 
     def _centroid_peak(centroid_list, np_img=None):
-        """Peak intensity (0-255) of the brightest centroid.
-
-        Primary path: read a 5x5 window around the brightest centroid's
-        pixel location from np_img and take the max. This gives actual
-        8-bit pixel intensity — what the log messages and auto_exp
-        saturation check were designed around — without scanning the
-        whole frame (25 pixels instead of 730K).
-
-        Fallback: the cached centroid attribute (_PEAK_ATTR). Note that
-        on tetra3rs 0.6.0 this resolves to `mass`, which is integrated
-        intensity, not peak. Only useful as a relative brightness proxy
-        when np_img isn't available.
-
-        Returns 0 if the list is empty or neither path works.
-        """
         if not centroid_list:
             return 0
         if np_img is not None:
             try:
-                # centroid coords are centred (origin = image centre,
-                # +X right, +Y down — tetra3rs convention). Convert to
-                # top-left-origin indexing for the numpy array.
                 cx = centroid_list[0].x
                 cy = centroid_list[0].y
                 row = int(round(CENTRE_Y + cy))
@@ -532,7 +446,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                 if r1 > r0 and c1 > c0:
                     return int(np_img[r0:r1, c0:c1].max())
             except Exception:
-                pass   # fall through to attribute path
+                pass
         if _PEAK_ATTR is not None:
             try:
                 return int(getattr(centroid_list[0], _PEAK_ATTR))
@@ -553,16 +467,12 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     frame_n       = 0
     offset_str    = '%1.3f,%1.3f' % (0.0, 0.0)
 
-    # --- background state-writer (item 10) ---
-    # Collect state into an in-memory dict on the hot path; flush it to
-    # /dev/shm at 2 Hz from a daemon thread. Saves the JSON serialize +
-    # write + fsync cost from the solve loop.
+    # --- background state-writer ---
     _state_snapshot = {}
     _state_lock     = _Lock()
     _state_dirty   = False
 
     def _snapshot_state():
-        """Hot-path: just stage the state dict, don't write."""
         nonlocal _state_dirty
         try:
             with open('/sys/class/thermal/thermal_zone0/temp') as f:
@@ -598,25 +508,19 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             _state_dirty = True
 
     def _write_state():
-        """Back-compat wrapper kept for the measure_offset / reset_offset
-        paths that expect a promptly-visible state file. Equivalent to
-        the in-memory snapshot pattern; the background thread will flush
-        within ~0.5 s, which is fine for those non-hot-path callers."""
         _snapshot_state()
 
     def _state_writer_thread():
         nonlocal _state_dirty
         last_flush = 0.0
         while True:
-            time.sleep(0.5)   # 2 Hz flush cadence
+            time.sleep(0.5)
             with _state_lock:
                 if not _state_dirty:
                     continue
                 snap = dict(_state_snapshot)
                 _state_dirty = False
             try:
-                # Atomic-ish: write to temp then rename. /dev/shm is tmpfs
-                # so rename is cheap and avoids readers seeing half a file.
                 tmp = STATE_FILE + '.tmp'
                 with open(tmp, 'w') as f:
                     json.dump(snap, f)
@@ -628,12 +532,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
     _Thread(target=_state_writer_thread, daemon=True,
             name='eFinder-state').start()
 
-    # --- background live-image writer (item 11) ---
-    # The live JPEG render is the single largest hidden cost in the solve
-    # loop (Pillow contrast + rotate + JPEG encode on a 960x760 array is
-    # easily 40-80ms on a Pi Zero 2W). Offload it to a thread with a
-    # size-1 queue so the solver never blocks, and the renderer always
-    # works on the newest available frame.
+    # --- background live-image writer ---
     _live_q = _ThreadQueue(maxsize=1)
 
     def _live_writer_thread():
@@ -668,9 +567,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             name='eFinder-live').start()
 
     def _write_live(arr):
-        """Hot-path: hand the frame to the render thread. Drops any backlog
-        so the renderer always operates on the newest frame; if it falls
-        behind we simply skip the older one rather than queuing it up."""
         if solve and solution is not None:
             overlay = 'RA %s  Dec %s  Stars %s  %.2fs' % (
                 coordinates.hh2dms(solved_radec[0] / 15),
@@ -678,12 +574,9 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                 stars, float(eTime))
         else:
             overlay = None
-        # arr is already a copy (from the triple-buffer read in the main
-        # loop), so passing it across the thread boundary is safe.
         try:
             _live_q.put_nowait((arr, overlay))
         except _QueueFull:
-            # Drop the previous pending frame and push the new one.
             try:
                 _live_q.get_nowait()
             except _QueueEmpty:
@@ -713,17 +606,12 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         t0 = time.time()
         np_img = img if img.dtype == np.uint8 else img.astype(np.uint8)
 
-        # tetra3rs centroid extraction — returns ExtractionResult with
-        # centroids already in centred pixel space, brightest first.
         extraction = tetra3rs.extract_centroids(
             np_img,
             sigma_threshold=_sigma_threshold,
             max_centroids=MAX_CENTROIDS,
         )
         centroid_list = extraction.centroids
-        # Peak brightness is read as the max of a 5x5 window around the
-        # brightest centroid — actual 8-bit pixel intensity, scoped to 25
-        # pixels instead of a full-frame np.max() scan (~730K elements).
         img_peak = _centroid_peak(centroid_list, np_img)
 
         print('[solver] centroids=%d  peak=%d' % (len(centroid_list), img_peak))
@@ -740,20 +628,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         fov_est, fov_err = _get_fov()
 
-        # Tracking mode: when we have a recent successful solve, pass its
-        # quaternion as `attitude_hint`. The solver then skips the expensive
-        # 4-star pattern-hash search and does direct correspondence matching
-        # against nearby catalog stars — typically 10-30 ms vs 100-500 ms
-        # for lost-in-space. If the hint is stale (big slew, lost stars,
-        # dome rotation lag), tetra3rs automatically falls back to
-        # lost-in-space since strict_hint=False by default. No manual
-        # retry needed.
-        #
-        # hint_uncertainty_deg sizes the cone search around the hint. For a
-        # well-tracking mount between 200ms frames, actual motion is a few
-        # arcsec; 1° is generous and keeps the cone small. Too tight and a
-        # momentary gust of wind could miss; too wide and we lose the
-        # speedup. 1° is a good starting point.
         kwargs = dict(
             fov_estimate_deg  = fov_est,
             fov_max_error_deg = fov_err,
@@ -766,9 +640,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
                 kwargs['hint_uncertainty_deg'] = 1.0
                 kwargs['solve_timeout_ms']     = SEEDED_TIMEOUT_MS
             except Exception as _hint_e:
-                # Older tetra3rs without tracking mode — ignore the hint and
-                # fall back to lost-in-space. Logged once at startup would
-                # be nicer than per-frame, but the cost is negligible.
                 print('[solver] attitude_hint not supported:', _hint_e)
                 kwargs.pop('attitude_hint', None)
                 kwargs.pop('hint_uncertainty_deg', None)
@@ -790,12 +661,8 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         solution       = sol
         centroids_last = centroid_list
-        firstCentroid  = centroid_list[0]   # brightest
+        firstCentroid  = centroid_list[0]
 
-        # sol.ra_deg / sol.dec_deg are the J2000 boresight.
-        # pixel_to_world maps any pixel (centred coords) into J2000 RA/Dec —
-        # this is the honest way to apply the offset, since tetra3rs does
-        # the focal-plane projection (with parity_flip correction) internally.
         try:
             target = sol.pixel_to_world(offset_cx, offset_cy)
         except Exception:
@@ -807,7 +674,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         _update_fov(sol.fov_deg)
 
-        # Precess J2000 -> JNow
         ra, dec = coordinates.precess(target_ra_deg, target_dec_deg)
 
         if _save_solved_frames:
@@ -819,7 +685,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         solved_radec = (ra, dec)
         solve = True
 
-        # Zero-copy hot path — SkySafari :GR/:GD read these directly.
         shared_ra.value  = ra
         shared_dec.value = dec
 
@@ -830,13 +695,13 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         except Exception:
             print('[solver] JNow', coordinates.hh2dms(ra / 15),
                   coordinates.dd2aligndms(dec))
-        _snapshot_state()   # hot path — in-memory only, bg thread flushes
+        _snapshot_state()
 
         if _MOUNT_MODE != 'none':
             _Thread(target=_push_mount, args=(ra, dec), daemon=True).start()
         return True
 
-    # --- mount push (ported from tiny_img) ---
+    # --- mount push ---
     _MOUNT_MODE   = param.get('mount_mode', 'none').lower().strip()
     _MOUNT_HOST   = param.get('mount_host', '192.168.0.1').strip()
     _MOUNT_PORT   = int(param.get('mount_port', '9999'))
@@ -908,8 +773,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             _, arr = cam_result_q.get(timeout=10.0)
             return arr
         except Exception:
-            # Fallback: grab whichever slot camera published most recently.
-            # Less fresh than an on-demand capture, but always available.
             return slot_bufs[latest_slot.value].copy()
 
     def _set_camera(exp, gain):
@@ -920,7 +783,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     # --- star name lookup ---
     def _lookup_star(catalog_id):
-        hipId = str(abs(int(catalog_id)))   # negative IDs = Hipparcos gap-fill
+        hipId = str(abs(int(catalog_id)))
         name = sn = ''
         try:
             with open(os.path.join(home_path, 'Solver/starnames.csv')) as f:
@@ -991,7 +854,6 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             if not ok:
                 offset_flag.value = False; return 'fail'
 
-            # firstCentroid.x / .y are centred pixel coordinates.
             cx = firstCentroid.x
             cy = firstCentroid.y
             offset_cx = cx
@@ -1099,33 +961,16 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         if frame_ready.wait(timeout=0.5) and not offset_flag.value:
             frame_ready.clear()
 
-            # Triple-buffered read with sequence consistency check.
-            # 1. Snapshot (slot, seq) — these two may be updated by camera
-            #    between reads, but we only care that the SEQ we record
-            #    belongs to the SLOT we actually copied from.
-            # 2. Copy that slot's contents.
-            # 3. Re-read seq. If it changed, camera published a new frame
-            #    during our copy — we may have read a mix of old+new bytes.
-            #    With 3 slots and camera rotating, the slot we copied from
-            #    is guaranteed not to be the one camera just wrote, so the
-            #    copy is actually consistent; the only thing we missed is
-            #    freshness. Accept the copy but log the skip.
             seq_before  = frame_seq.value
             slot_before = latest_slot.value
             img = slot_bufs[slot_before].copy()
             seq_after   = frame_seq.value
 
             if seq_before == last_solved_seq:
-                # Same frame we already solved; woke up spuriously or the
-                # solver outran the camera. Skip without logging noise.
                 continue
 
             skipped = seq_before - last_solved_seq - 1
             if skipped > 0:
-                # Camera published more frames than we could solve. This is
-                # normal when a solve takes longer than one exposure — log
-                # at low volume so it shows up in profiling but doesn't
-                # spam the journal during steady-state operation.
                 print('[solver] skipped %d frame(s) (seq %d -> %d)' %
                       (skipped, last_solved_seq, seq_before))
             if seq_after != seq_before:
@@ -1148,15 +993,12 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
     """
     Serves SkySafari on port 4060.
     Reads ra/dec directly from shared Values - no IPC latency on hot path.
-    Reads other telemetry from /dev/shm/efinder_state.json (non-critical path).
-    Sends tuning/on-demand commands to solver via lx200_cmd_q.
     Also serves maintenance socket at /run/efinder/maint.sock for Flask webui.
     """
     _pin_cpu('lx200')
     coordinates = Coordinates()
 
     def _read_state(key, default=''):
-        """Read a single key from the JSON state file — non-critical path only."""
         try:
             with open(STATE_FILE) as f:
                 return str(json.load(f).get(key, default))
@@ -1302,9 +1144,6 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
     while True:
         try:
             client, address = s.accept()
-            # TCP-level tuning for SkySafari's many small :GR/:GD polls:
-            # disable Nagle so each reply flushes immediately rather than
-            # waiting 40 ms for a coalescing partner.
             try:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception: pass
@@ -1313,14 +1152,8 @@ def lx200_process(lx200_cmd_q, lx200_result_q,
                 data = client.recv(1024)
                 if not data: break
                 pkt = data.decode('utf-8', 'ignore')
-                # Item 7: previously time.sleep(0.02) — 20 ms of deliberate
-                # latency on every SkySafari poll. Reduced to 1 ms as a
-                # conservative first landing; can be removed entirely once
-                # field-tested. TCP_NODELAY (set above) already handles
-                # Nagle coalescing.
                 time.sleep(0.001)
 
-                # Hot path: read directly from shared memory — no IPC.
                 ra  = shared_ra.value
                 dec = shared_dec.value
                 raPacket  = coordinates.hh2dms(ra / 15) + '#'
@@ -1462,28 +1295,19 @@ def main():
     _pin_cpu('main')
     print('eFinder version', version)
 
-    # Triple-buffered frame slots. Each is a separate SharedMemory region
-    # of FRAME_SZ bytes; camera rotates writes across them, solver reads
-    # whichever one latest_slot indicates.
     shms = [shared_memory.SharedMemory(create=True, size=FRAME_SZ)
             for _ in range(N_FRAME_SLOTS)]
     shm_names = [s.name for s in shms]
     print('Frame slots:', shm_names, '(%d bytes each)' % FRAME_SZ)
 
-    # Atomic handoff Values (items 1 + 3).
-    # latest_slot: which slot was most recently fully written.
-    # frame_seq:   monotonic frame counter; solver uses it to detect
-    #              skipped frames and to avoid re-solving the same frame.
     latest_slot = Value(ctypes.c_int, 0)
     frame_seq   = Value(ctypes.c_uint64, 0)
 
-    # shared Values for hot-path ra/dec — direct memory read, zero IPC
     shared_ra   = Value(ctypes.c_double, 0.0)
     shared_dec  = Value(ctypes.c_double, 0.0)
     offset_flag = Value(ctypes.c_bool, False)
     test_mode   = Value(ctypes.c_bool, test_image_path is not None)
 
-    # queues and events
     frame_ready    = Event()
     cam_cmd_q      = Queue()
     cam_result_q   = Queue()
@@ -1492,8 +1316,6 @@ def main():
     maint_cmd_q    = Queue()
     maint_result_q = Queue()
 
-    # Store target/args alongside each Process so the restart logic can
-    # reconstruct them without relying on private _target/_args attributes.
     proc_specs = {
         'camera': dict(
             target=camera_process,
