@@ -17,8 +17,6 @@
 #   Process 2 (solver):  tetra3rs extract + solve -> shared Values + JSON.
 #   Process 3 (lx200):   LX200/WiFi server — reads Values directly, no IPC lag.
 #
-# CPU affinity (Pi Zero 2W): 0=kernel, 1=lx200, 2=solver(tetra3rs), 3=camera
-#
 # Inter-process communication:
 #   frame_shm      — SharedMemory  (760x960 uint8, camera -> solver)
 #   frame_ready    — Event         (camera signals solver: new frame ready)
@@ -28,649 +26,914 @@
 #   test_mode      — Value(c_bool)   lx200 sets, camera reads
 #   cmd_q          — Queue  lx200 -> solver: tuning/on-demand commands
 #   result_q       — Queue  solver -> lx200: command results
-#   cam_cmd_q      — Queue  solver -> camera: set_exp, capture_now
-#   shared_cfg     — Manager().dict() IMU state + calibration, all workers
+#   cam_cmd_q      — Queue  solver -> camera: set_exp, capture_once
+#   cam_result_q   — Queue  camera -> solver: captured frames
 #
-# Coordinate system: J2000 RA/Dec throughout. LX200 protocol conversion in lx200
-# worker only.
-#
-# Usage: python3 eFinder_tetra3rs_mp.py [--help]
+# /dev/shm/efinder_state.json  written by solver after each solve — slow
+#   telemetry (stars, peak, eTime, etc.) read by lx200 only for diagnostic
+#   commands (:GS, :GK, :Gt) which are not timing-critical.
 
-import argparse
-import array
-import ast
-import csv
-import datetime
-import json
-import logging
-import math
-import multiprocessing as mp
 import os
-import re
-import shutil
-import socket
-import struct
-import subprocess
 import sys
-import threading
+import math
+import socket
 import time
-import traceback
-from ctypes import c_bool, c_double
-from multiprocessing import shared_memory
+import csv
+import json
+import ctypes
+from datetime import datetime
 from pathlib import Path
+from multiprocessing import (
+    Process, Queue, Event, Value,
+    shared_memory, set_start_method
+)
 
 import numpy as np
 
-try:
-    import tetra3rs
-except ImportError:
-    print('[FATAL] tetra3rs not found — install the Rust/PyO3 extension', flush=True)
-    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+home_path   = str(Path.home())
+version     = "6.6-tetra3rs-mp-tb8"
+config_path = os.path.join(home_path, "Solver/eFinder.config")
+solver_path = os.path.join(home_path, "Solver")
 
-try:
-    from picamera2 import Picamera2
-except ImportError:
-    Picamera2 = None  # allow import for unit-testing on non-Pi hosts
+FRAME_H  = 760
+FRAME_W  = 960
+FRAME_SZ = FRAME_H * FRAME_W
 
-try:
-    from imu_math import quat_delta_rotvec as _quat_delta_rotvec
-    _IMU_MATH_OK = True
-except ImportError:
-    _IMU_MATH_OK = False
-    def _quat_delta_rotvec(q_now, q_ref):
-        return (0.0, 0.0, 0.0)
+CAM_ARCSEC_PX = 50.8
+CAM_FOV_DEG   = 13.5
 
-# ── logging ────────────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level   = logging.INFO,
-    format  = '%(asctime)s %(processName)-14s %(levelname)s %(message)s',
-    datefmt = '%H:%M:%S',
-)
-log = logging.getLogger(__name__)
+STATE_FILE = '/dev/shm/efinder_state.json'
+LIVE_IMAGE = '/dev/shm/efinder_live.jpg'
 
-# ── paths ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-home_path  = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-_param_path = os.path.join(home_path, 'Solver/eFinder.config')
+# tetra3rs centroid convention: origin at image centre, +X right, +Y down.
+# Offset stored in eFinder.config as arcminutes on sky; converted to centred
+# pixel space for solver queries.
+CENTRE_X = FRAME_W / 2.0
+CENTRE_Y = FRAME_H / 2.0
 
-# ── constants ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-FRAME_H         = 760
-FRAME_W         = 960
-FRAME_BYTES     = FRAME_H * FRAME_W        # uint8 greyscale
-MAX_CENTROIDS   = 50
-CAPTURE_TIMEOUT = 8.0   # seconds
-HEALTH_POLL    = 10.0   # seconds between health checks
-RESTART_LIMIT   = 3     # max automatic restarts per worker
+# Triple-buffered camera -> solver frame handoff (items 1 + 3).
+# Three SharedMemory slots; camera rotates writes across the two slots
+# that the solver isn't currently reading. latest_slot and frame_seq are
+# published atomically as the final step of each write.
+N_FRAME_SLOTS = 3
 
-
-def _pin_to_cpu(cpu):
-    """Pin the calling process to a single CPU core to reduce scheduling jitter."""
-    try:
-        os.sched_setaffinity(0, {cpu})
-        log.info('pinned to CPU %d', cpu)
-    except Exception as e:
-        log.warning('could not pin to CPU %d: %s', cpu, e)
-
-
-# ── shared parameter helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 def load_param():
-    """Load key=value config; return dict."""
-    p = {}
-    try:
-        with open(_param_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                if '=' in line:
-                    k, _, v = line.partition('=')
-                    p[k.strip()] = v.strip()
-    except FileNotFoundError:
-        pass
-    return p
+    param = {}
+    if os.path.exists(config_path):
+        with open(config_path) as h:
+            for line in h:
+                parts = line.strip("\n").split(":")
+                if len(parts) == 2:
+                    param[parts[0]] = str(parts[1])
+    return param
 
-def save_param(p):
-    os.makedirs(os.path.dirname(_param_path), exist_ok=True)
-    with open(_param_path, 'w') as f:
-        for k, v in sorted(p.items()):
-            f.write('%s=%s\n' % (k, v))
+def save_param(param):
+    with open(config_path, "w") as h:
+        for key, value in param.items():
+            h.write("%s:%s\n" % (key, value))
 
-# ── catalogue helpers ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-def load_catalogue():
-    """Return list-of-dicts from Solver/catalogue.csv (ra,dec,hipId columns)."""
-    cat = []
-    path = os.path.join(home_path, 'Solver/catalogue.csv')
-    try:
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    cat.append({
-                        'ra':  float(row['ra']),
-                        'dec': float(row['dec']),
-                        'id':  str(row.get('hipId', row.get('id', ''))),
-                    })
-                except (ValueError, KeyError):
-                    pass
-    except Exception:
-        pass
-    return cat
+# ---------------------------------------------------------------------------
+# Coordinate helpers
+# ---------------------------------------------------------------------------
+class Coordinates:
+    def __init__(self):
+        self._update_precession_constants()
 
+    def _update_precession_constants(self):
+        now  = datetime.now()
+        decY = now.year + int(now.strftime('%j')) / 365.25
+        self.t = decY - 2000
+        self.T = self.t / 100
+        self.m  = 3.07496 + 0.00186 * self.T
+        self.n2 = 20.0431 - 0.0085  * self.T
+        self.n1 = 1.33621 - 0.00057 * self.T
 
-def _imu_predict(shared_cfg):
-    """
-    Return IMU dead-reckoning (ra_deg, dec_deg) or None.
-
-    Uses the 2x3 calibration matrix built passively from consecutive
-    plate-solves.  Falls through to None whenever the IMU is absent,
-    data is stale, calibration is insufficient, or the predicted delta
-    exceeds the 5-degree safety cap.
-    """
-    if not shared_cfg.get('imu_available', False):
-        return None
-    if shared_cfg.get('imu_calib_n', 0) < 3:
-        return None
-    if shared_cfg.get('imu_calib_quality', 0.0) < 0.85:
-        return None
-
-    q_now = shared_cfg.get('imu_q')
-    imu_t = shared_cfg.get('imu_t', 0.0)
-    if q_now is None or time.monotonic() - imu_t > 2.0:
-        return None
-
-    q_ref   = shared_cfg.get('imu_ref_q')
-    ra_ref  = shared_cfg.get('imu_ref_ra_deg')
-    dec_ref = shared_cfg.get('imu_ref_dec_deg')
-    ref_t   = shared_cfg.get('imu_ref_t', 0.0)
-    if q_ref is None or ra_ref is None or time.monotonic() - ref_t > 120.0:
-        return None
-
-    C_flat = shared_cfg.get('imu_calib_C')
-    if C_flat is None or len(C_flat) != 6:
-        return None
-
-    try:
-        r = _quat_delta_rotvec(q_now, q_ref)
-    except Exception:
-        return None
-
-    c  = C_flat
-    dr = c[0]*r[0] + c[1]*r[1] + c[2]*r[2]   # camera-right
-    du = c[3]*r[0] + c[4]*r[1] + c[5]*r[2]   # camera-up
-
-    roll_ref = shared_cfg.get('imu_ref_roll_deg', 0.0)
-    roll_rad = math.radians(roll_ref)
-    cos_r, sin_r = math.cos(roll_rad), math.sin(roll_rad)
-    dra_rad  =  dr * cos_r - du * sin_r
-    ddec_rad =  dr * sin_r + du * cos_r
-
-    if abs(dra_rad) > math.radians(5.0) or abs(ddec_rad) > math.radians(5.0):
-        return None
-
-    cos_dec = math.cos(math.radians(dec_ref))
-    if abs(cos_dec) < 0.01:
-        return None  # within ~0.6 deg of a pole
-
-    ra_pred  = (ra_ref  + math.degrees(dra_rad)  / cos_dec) % 360.0
-    dec_pred = max(-90.0, min(90.0, dec_ref + math.degrees(ddec_rad)))
-    return ra_pred, dec_pred
-
-
-# ── OTA update ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-def check_update():
-    """Return (new_version_str, tarball_url) or (None, None)."""
-    manifest = os.path.join(home_path, 'update_manifest.json')
-    try:
-        with open(manifest) as f:
-            m = json.load(f)
-        current = m.get('current_version', '0.0.0')
-        latest  = m.get('latest_version',  '0.0.0')
-        url     = m.get('download_url', '')
-        if latest != current and url:
-            return latest, url
-    except Exception:
-        pass
-    return None, None
-
-def apply_update(url):
-    tmp = '/tmp/efinder_update.tar.gz'
-    subprocess.run(['wget', '-q', '-O', tmp, url], check=True, timeout=60)
-    subprocess.run(['tar', '-xzf', tmp, '-C', home_path], check=True)
-    log.info('[main] OTA update applied from %s', url)
-
-# ── proc_specs restart registry ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-restart_counts = {}
-
-def _start_worker(spec, shared):
-    name = spec['name']
-    restart_counts.setdefault(name, 0)
-    extra = spec.get('args', ())
-    p = mp.Process(
-        target = spec['target'],
-        args   = shared + tuple(extra),
-        name   = name,
-        daemon = True,
-    )
-    p.start()
-    log.info('[main] started %s pid=%d', name, p.pid)
-    return p
-
-# ───────────────────────────────────────────────────────────────────────────────────
-# PROCESS 1 — camera
-# ───────────────────────────────────────────────────────────────────────────────────
-
-def camera_worker(
-    frame_shm_name, frame_ready,
-    shared_ra, shared_dec, offset_flag,
-    keep, test_mode,
-    cmd_q, result_q, cam_cmd_q,
-    *_extra,
-):
-    """
-    Capture loop.  Writes greyscale frames to shared memory, then signals
-    frame_ready.  Obeys cam_cmd_q for set_exp / capture_now.
-    """
-    import signal
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-    shm  = shared_memory.SharedMemory(name=frame_shm_name)
-    buf  = np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=shm.buf)
-
-    param = load_param()
-    _pin_to_cpu(int(param.get('CpuCamera', '3')))
-    exposure = float(param.get('Exposure', '0.2'))
-    gain     = float(param.get('Gain', '20'))
-
-    cam = None
-    if Picamera2 is not None and not test_mode.value:
-        try:
-            cam = Picamera2()
-            cfg = cam.create_still_configuration(
-                main={'size': (FRAME_W, FRAME_H), 'format': 'YUV420'},
-                buffer_count=2,
-            )
-            cam.configure(cfg)
-            cam.set_controls({'ExposureTime': int(exposure * 1e6), 'AnalogueGain': gain})
-            cam.start()
-        except Exception as e:
-            log.warning('[camera] picamera2 init failed: %s', e)
-            cam = None
-
-    log.info('[camera] started, test_mode=%s', test_mode.value)
-
-    def _apply_set_exp(exp, gn, persist=True):
-        nonlocal exposure, gain
-        exposure, gain = float(exp), float(gn)
-        if cam:
-            cam.set_controls({'ExposureTime': int(exposure * 1e6), 'AnalogueGain': gain})
-
-    capture_event = threading.Event()
-    capture_result = [None]
-
-    def _capture_frame():
-        if cam:
-            arr = cam.capture_array('main')
-            # YUV420 -> Y plane
-            buf[:] = arr[:FRAME_H, :FRAME_W]
+    def dateSet(self, timeOffset, timeStr, dateStr):
+        days = 0
+        sg   = float(timeOffset)
+        hours, minutes, seconds = timeStr.split(':')
+        hours = int(hours) + sg
+        if hours >= 24:
+            hours = str(int(hours - 24)); days = 1
+        elif hours < 0:
+            hours = str(int(hours + 24)); days = -1
         else:
-            # synthetic star field for testing
-            buf[:] = np.random.randint(0, 30, (FRAME_H, FRAME_W), dtype=np.uint8)
-            rng = np.random.default_rng()
-            for _ in range(30):
-                r = rng.integers(5, FRAME_H - 5)
-                c = rng.integers(5, FRAME_W - 5)
-                buf[r-2:r+3, c-2:c+3] = rng.integers(180, 255)
+            hours = str(int(hours))
+        timeStr = hours + ':' + minutes + ':' + seconds
+        month, day, year = dateStr.split('/')
+        day = str(int(day) + days)
+        dateStr = month + '/' + day + '/20' + year
+        dt_str = dateStr + ' ' + timeStr
+        print('Calculated UTC', dt_str)
+        os.system('sudo date -u --set "%s"' % dt_str + '.000Z')
+        self._update_precession_constants()
 
-    while keep.value:
-        # drain cmd queue
-        while True:
-            try:
-                cmd = cam_cmd_q.get_nowait()
-            except Exception:
-                break
-            if cmd[0] == 'set_exp':
-                _apply_set_exp(cmd[1], cmd[2])
-            elif cmd[0] == 'capture_now':
-                capture_event.set()
+    def precess(self, r, d):
+        dR = self.m + self.n1 * math.sin(math.radians(r)) * math.tan(math.radians(d))
+        dD = self.n2 * math.cos(math.radians(r))
+        return r + dR / 240 * self.t, d + dD / 3600 * self.t
 
-        _capture_frame()
-        frame_ready.set()
-        time.sleep(max(0.05, exposure))
+    def hh2dms(self, dd):
+        minutes, seconds = divmod(abs(dd) * 3600, 60)
+        degrees, minutes = divmod(minutes, 60)
+        return '%02d:%02d:%02d' % (degrees, minutes, seconds)
 
-    if cam:
-        cam.stop()
-        cam.close()
-    shm.close()
-    log.info('[camera] exiting')
+    def dd2aligndms(self, dd):
+        sign = '+' if dd >= 0 else '-'
+        minutes, seconds = divmod(abs(dd) * 3600, 60)
+        degrees, minutes = divmod(minutes, 60)
+        return '%s%02d*%02d:%02d' % (sign, degrees, minutes, seconds)
 
+    def dd2dms(self, dd):
+        sign = '+' if dd >= 0 else '-'
+        minutes, seconds = divmod(abs(dd) * 3600, 60)
+        degrees, minutes = divmod(minutes, 60)
+        return '%s%02d:%02d:%02d' % (sign, degrees, minutes, seconds)
 
-# ───────────────────────────────────────────────────────────────────────────────────
-# PROCESS 2 — solver
-# ───────────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Offset / pixel conversion (tetra3rs centred convention)
+# d_x / d_y stored in eFinder.config in arcminutes on sky.
+# ---------------------------------------------------------------------------
+def dxdy2centred(dx_deg, dy_deg):
+    """Convert angular offset (degrees) to centred pixel coords."""
+    cx =  dx_deg * 3600 / CAM_ARCSEC_PX      # +X right
+    cy = -dy_deg * 3600 / CAM_ARCSEC_PX      # +Y down (dy up = negative cy)
+    return cx, cy
 
-def solver_worker(
-    frame_shm_name, frame_ready,
-    shared_ra, shared_dec, offset_flag,
-    keep, test_mode,
-    cmd_q, result_q, cam_cmd_q,
-    shared_cfg,
-    *_extra,
-):
-    import signal
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+def centred2dxdy(cx, cy):
+    """Convert centred pixel coords to angular offset (degrees)."""
+    dx_deg =  cx * CAM_ARCSEC_PX / 3600
+    dy_deg = -cy * CAM_ARCSEC_PX / 3600
+    return dx_deg, dy_deg
 
-    from calibration import FovCalibrator
-    from polar_run import PolarAligner, PolarState
+# ---------------------------------------------------------------------------
+# CPU affinity helper (item 5)
+# ---------------------------------------------------------------------------
+# The Pi Zero 2W has 4x Cortex-A53. We pin each worker to specific cores
+# to keep the solver's hot numeric loop from being interrupted by camera
+# DMA completion handling or by SkySafari socket traffic, and to give the
+# solver's two background threads (state writer, live JPEG renderer) room
+# to run without stealing cycles from the main solve loop.
+#
+# Mapping (see CPU_PINNING dict). Tuneable if field measurements suggest
+# a different assignment works better.
+#
+# sched_setaffinity can fail on restricted kernels, inside containers, or
+# when systemd CPUAffinity= is already set; we log and carry on. Losing
+# the tuning doesn't break correctness.
 
-    # Start IMU daemon thread (no-op if smbus2/BNO055 absent)
+CPU_PINNING = {
+    'main':   {0},      # supervisor — idle most of the time
+    'camera': {0},      # light work, shares with USB/SDIO IRQs
+    'lx200':  {1},      # isolated from solver so replies never queue
+    'solver': {2, 3},   # heavy: main loop + state thread + live-jpeg thread
+}
+
+def _pin_cpu(label):
+    """Best-effort CPU affinity pin. Logs result, never raises."""
+    cores = CPU_PINNING.get(label)
+    if not cores:
+        return
     try:
-        from imu_proc import start_imu_thread
-        start_imu_thread(shared_cfg)
-    except Exception as _e:
-        log.warning('[solver] IMU thread not started: %s', _e)
+        # Verify requested cores actually exist on this box. On non-Pi
+        # hardware or odd kernels we just log and skip rather than pin
+        # to a phantom core.
+        avail = os.sched_getaffinity(0)
+        want  = cores & avail
+        if not want:
+            print('[%s] cpu pin skipped: requested %s not in available %s' %
+                  (label, sorted(cores), sorted(avail)))
+            return
+        os.sched_setaffinity(0, want)
+        # Read back what actually stuck (cgroups can narrow the set).
+        got = os.sched_getaffinity(0)
+        if got == want:
+            print('[%s] cpu pin: cores %s' % (label, sorted(got)))
+        else:
+            print('[%s] cpu pin partial: asked %s, got %s' %
+                  (label, sorted(want), sorted(got)))
+    except (OSError, AttributeError) as e:
+        # AttributeError handles the unlikely case of a Python build
+        # without sched_setaffinity (not Linux, not CPython on Linux, etc.)
+        print('[%s] cpu pin not supported: %s' % (label, e))
 
-    shm  = shared_memory.SharedMemory(name=frame_shm_name)
-    frame = np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=shm.buf)
+# ===========================================================================
+# PROCESS 1 - Camera
+# ===========================================================================
+def camera_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
+                   test_mode, latest_slot, frame_seq, test_image_path=None):
+    """
+    Owns Picamera2. Rotates writes across three SharedMemory slots so the
+    solver can read the most-recently-published slot without racing the
+    writer. Publishes (latest_slot, frame_seq) atomically after each write.
+
+    shm_names   : list of 3 SharedMemory names (created by main)
+    frame_ready : Event — set after each completed publish
+    latest_slot : Value(c_int)  — index (0/1/2) of last fully-written slot
+    frame_seq   : Value(c_uint64) — monotonic frame counter
+
+    Commands on cam_cmd_q:
+        ('set_exp', exposure, gain)
+        ('capture_once', None, None)  -> puts ('frame', array) on cam_result_q
+        ('stop', None, None)
+    """
+    _pin_cpu('camera')
+    from picamera2 import Picamera2
 
     param = load_param()
-    _pin_to_cpu(int(param.get('CpuSolver', '2')))
 
-    # ── calibrator ──
-    _calibrator = FovCalibrator(
-        param,
-        save_param,
-        float(param.get('FOV', '5.0')),
-        FRAME_W,
+    # Attach to all three SHM slots; wrap each as a numpy view so np.copyto
+    # writes straight into shared memory with no intermediate allocation.
+    shms      = [shared_memory.SharedMemory(name=n) for n in shm_names]
+    slot_bufs = [np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=s.buf)
+                 for s in shms]
+
+    picam2 = Picamera2()
+    cfg = picam2.create_still_configuration(
+        main={"size": (FRAME_W, FRAME_H), "format": "YUV420"},
+        sensor={"output_size": (2028, 1520)},
+        buffer_count=2,
     )
+    picam2.configure(cfg)
 
-    # ── polar aligner ──
-    _polar_lat = None
-    try:
-        _polar_lat = float(param.get('Latitude', ''))
-    except (ValueError, TypeError):
-        pass
-    _polar = PolarAligner(latitude_deg=_polar_lat)
+    def _apply(exp_s, gain):
+        picam2.stop()
+        picam2.set_controls({
+            "AeEnable":     False,
+            "AwbEnable":    False,
+            "ExposureTime": int(float(exp_s) * 1_000_000),
+            "AnalogueGain": int(float(gain)),
+        })
+        picam2.start()
 
-    # ── solver state ──
-    solved_radec   = None    # (ra_deg, dec_deg) J2000
-    solve          = True
-    frame_n        = 0
-    _fov_measured  = None
-    _detect_sigma  = float(param.get('Sigma', '8'))
+    _apply(param.get("Exposure", "0.2"), param.get("Gain", "20"))
+    test_path = os.path.join(home_path, "Solver/test.npy")
 
-    # Restore persisted boresight offset so alignment survives restarts
-    offset_cx  = float(param.get('OffsetCX', '0.0'))
-    offset_cy  = float(param.get('OffsetCY', '0.0'))
-    if offset_cx or offset_cy:
-        offset_str    = 'boresight cx=%.1f cy=%.1f' % (offset_cx, offset_cy)
-        offset_flag.value = True
-    else:
-        offset_str    = 'no offset'
+    def _capture():
+        if test_mode.value:
+            if test_image_path is not None and os.path.exists(test_image_path):
+                from PIL import Image as _PilImage
+                _img = _PilImage.open(test_image_path).convert('L')
+                if _img.size != (FRAME_W, FRAME_H):
+                    _img = _img.resize((FRAME_W, FRAME_H), _PilImage.LANCZOS)
+                return np.array(_img, dtype=np.uint8)
+            if os.path.exists(test_path):
+                return np.load(test_path)
+        arr = np.array(picam2.capture_array())
+        return arr[0:FRAME_H, 0:FRAME_W]
 
-    # Auto-exposure loop state
-    _auto_exp_state = {'last_stars': 0, 'last_adj': 0.0}
+    def _pick_write_slot(last_published):
+        """
+        Return a slot index that the solver is guaranteed not to be reading
+        right now. With 3 slots and the solver always reading whichever slot
+        was most recently published, we just pick any slot other than the
+        published one. We prefer to rotate so we don't write to the same
+        slot twice in a row — gives the solver a full extra cycle of
+        read-safety headroom if it gets preempted mid-copy.
+        """
+        # Rotate: (published + 1) mod N. The solver may still be reading
+        # `published` but not this next slot.
+        return (last_published + 1) % N_FRAME_SLOTS
 
-    # ── result JSON path ──
-    result_path = os.path.join(home_path, 'Solver/solve_result.json')
+    last_published = -1   # sentinel: first pick goes to slot 0
 
-    # ── tetra3rs solver handle ──
-    cat_path = os.path.join(home_path, 'Solver/tetra3_index_1.6_0.4.bin')
-    try:
-        solver = tetra3rs.Tetra3(cat_path)
-    except Exception as e:
-        log.error('[solver] failed to load catalogue: %s', e)
-        shm.close(); return
+    print('[camera] ready (triple-buffered)')
 
-    # ── catalogue for seeded solve ──
-    catalogue = load_catalogue()
-
-    # ── IMU calibration state ──
-    _imu_calib_state = {
-        'pairs':     [],
-        'prev_q':    None,
-        'prev_ra':   None,
-        'prev_dec':  None,
-        'prev_roll': None,
-    }
-
-    def _refit_imu_calib():
-        pairs = _imu_calib_state['pairs']
-        n = len(pairs)
-        shared_cfg['imu_calib_n'] = n
-        if n < 3:
-            return
+    while True:
+        # drain on-demand commands
         try:
-            X = np.array([[rv[0], rv[1], rv[2]] for rv, cr, cu in pairs])
-            Y = np.array([[cr, cu]               for rv, cr, cu in pairs])
-            C_T = np.linalg.lstsq(X, Y, rcond=None)[0]
-            C   = C_T.T
-            Y_pred  = X @ C_T
-            ss_res  = float(np.sum((Y - Y_pred) ** 2))
-            ss_tot  = float(np.sum((Y - Y.mean(axis=0)) ** 2))
-            quality = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
-            shared_cfg['imu_calib_C']       = C.ravel().tolist()
-            shared_cfg['imu_calib_quality'] = max(0.0, min(1.0, quality))
-        except Exception as _e:
-            log.debug('[solver] imu refit error: %s', _e)
-
-    # ── helpers ──
-
-    def _request_capture():
-        frame_ready.clear()
-        cam_cmd_q.put(('capture_now',))
-        if not frame_ready.wait(CAPTURE_TIMEOUT):
-            raise TimeoutError('frame capture timed out')
-        return frame.copy()
-
-    def _centroid_peak(centroids, img):
-        if not centroids:
-            return 0
-        peaks = []
-        for cx, cy, *_ in centroids:
-            r, c = int(cy), int(cx)
-            patch = img[max(0,r-2):r+3, max(0,c-2):c+3]
-            peaks.append(int(patch.max()) if patch.size else 0)
-        return max(peaks)
-
-    def _do_solve(img):
-        nonlocal solved_radec, _fov_measured
-        ext = tetra3rs.extract_centroids(
-            img,
-            sigma_threshold = _detect_sigma,
-            max_centroids   = MAX_CENTROIDS,
-        )
-
-        fov_hint  = _calibrator.get_fov_estimate()
-        ra_hint   = dec_hint = None
-        if solved_radec:
-            ra_hint, dec_hint = solved_radec
-
-        result = None
-        if ra_hint is not None and fov_hint is not None:
-            try:
-                result = solver.solve_from_centroids(
-                    ext,
-                    (FRAME_H, FRAME_W),
-                    fov_estimate    = fov_hint,
-                    fov_max_error   = 0.2,
-                    target_ra       = ra_hint,
-                    target_dec      = dec_hint,
-                    search_radius   = 5.0,
-                    match_threshold = 1e-5,
-                    solve_timeout   = int(param.get('SolveTimeoutMs', '1500')) / 1000.0,
-                )
-            except Exception:
-                result = None
-
-        if result is None:
-            try:
-                result = solver.solve_from_centroids(
-                    ext,
-                    (FRAME_H, FRAME_W),
-                    fov_estimate    = _calibrator.get_fov_estimate() or float(param.get('FOV', '5.0')),
-                    fov_max_error   = _calibrator.get_fov_max_error(),
-                    match_threshold = 1e-6,
-                    solve_timeout   = int(param.get('SolveTimeoutMs', '1500')) / 1000.0,
-                )
-            except Exception as e:
-                log.debug('[solver] blind solve error: %s', e)
-                return False
-
-        if result is None:
-            return False
-
-        ra_deg   = result.ra
-        dec_deg  = result.dec
-        roll_deg = getattr(result, 'roll', 0.0) or 0.0
-        if hasattr(result, 'fov'):
-            _fov_measured = result.fov
-            _calibrator.update_from_solve(result.fov, getattr(result, 'distortion', 0.0) or 0.0)
-
-        # apply boresight offset
-        if offset_flag.value and (offset_cx or offset_cy):
-            plate_scale = (_fov_measured or float(param.get('FOV','5.0'))) / FRAME_H
-            dec_deg += offset_cy * plate_scale
-            ra_deg  += offset_cx * plate_scale / max(0.01, math.cos(math.radians(dec_deg)))
-
-        solved_radec     = (ra_deg, dec_deg)
-        shared_ra.value  = ra_deg
-        shared_dec.value = dec_deg
-
-        _stars   = len(ext.centroids) if hasattr(ext, 'centroids') else 0
-        _peak    = _centroid_peak(ext.centroids, img) if hasattr(ext, 'centroids') else 0
-        _matches = getattr(result, 'matches', 0) or getattr(result, 'num_matches', 0)
-
-        # Record star count for auto-exposure loop
-        _auto_exp_state['last_stars'] = _stars
-
-        # nearest catalogue star
-        name = sn = hipId = ''
-        if catalogue:
-            ra_r  = math.radians(ra_deg)
-            dec_r = math.radians(dec_deg)
-            best  = None
-            for star in catalogue:
-                d = math.acos(max(-1.0, min(1.0,
-                    math.sin(dec_r)*math.sin(math.radians(star['dec'])) +
-                    math.cos(dec_r)*math.cos(math.radians(star['dec'])) *
-                    math.cos(ra_r - math.radians(star['ra']))
-                )))
-                if best is None or d < best[0]:
-                    best = (d, star)
-            if best and best[0] < math.radians(0.5):
-                cat_id = best[1]['id']
-                name, sn, hipId = _lookup_star(cat_id)
-
-        ra_h    = ra_deg / 15.0
-        ra_hms  = '%02dh%02dm%05.2fs' % (int(ra_h), int((ra_h%1)*60), ((ra_h*60)%1)*60)
-        dec_dms = '%+03dd%02dm%05.2fs' % (int(dec_deg), int(abs(dec_deg)%1*60),
-                                           (abs(dec_deg)*60%1)*60)
-        payload = {
-            'ra_deg':   ra_deg,
-            'dec_deg':  dec_deg,
-            'ra':       ra_hms,
-            'dec':      dec_dms,
-            'star':     '%s%s' % (name, sn) if name else '',
-            'hip':      hipId,
-            'frame':    frame_n,
-            'ts':       datetime.datetime.utcnow().isoformat(),
-            'offset':   offset_str,
-            'fov':      round(_fov_measured, 4) if _fov_measured else None,
-            'solved':   True,
-            'stars':    _stars,
-            'peak':     _peak,
-            'matches':  _matches,
-            'solve_ms': 0,
-            'roll_deg': roll_deg,
-            'status':   1,
-        }
-        try:
-            with open(result_path, 'w') as f:
-                json.dump(payload, f)
+            while True:
+                cmd, a, b = cam_cmd_q.get_nowait()
+                if cmd == 'set_exp':
+                    _apply(a, b)
+                elif cmd == 'capture_once':
+                    cam_result_q.put(('frame', _capture().copy()))
+                elif cmd == 'stop':
+                    picam2.stop()
+                    for s in shms: s.close()
+                    return
         except Exception:
             pass
 
-        # IMU dead-reckoning reference + calibration pair
-        if shared_cfg.get('imu_available', False):
-            q_now = shared_cfg.get('imu_q')
-            if q_now is not None:
-                t_now = time.monotonic()
-                shared_cfg['imu_ref_q']        = q_now
-                shared_cfg['imu_ref_ra_deg']   = ra_deg
-                shared_cfg['imu_ref_dec_deg']  = dec_deg
-                shared_cfg['imu_ref_t']        = t_now
-                shared_cfg['imu_ref_roll_deg'] = roll_deg
-                if _imu_calib_state['prev_q'] is not None:
-                    try:
-                        rv = _quat_delta_rotvec(q_now, _imu_calib_state['prev_q'])
-                        dra_deg  = ((ra_deg - _imu_calib_state['prev_ra']  + 180) % 360) - 180
-                        ddec_deg =   dec_deg - _imu_calib_state['prev_dec']
-                        if abs(dra_deg) < 10 and abs(ddec_deg) < 10:
-                            pr       = math.radians(_imu_calib_state['prev_roll'] or 0.0)
-                            cos_dec  = math.cos(math.radians(dec_deg))
-                            dra_rad  = math.radians(dra_deg) * cos_dec
-                            ddec_rad = math.radians(ddec_deg)
-                            cam_r =  dra_rad * math.cos(pr) + ddec_rad * math.sin(pr)
-                            cam_u = -dra_rad * math.sin(pr) + ddec_rad * math.cos(pr)
-                            _imu_calib_state['pairs'].append((rv, cam_r, cam_u))
-                            if len(_imu_calib_state['pairs']) > 50:
-                                _imu_calib_state['pairs'].pop(0)
-                            _refit_imu_calib()
-                    except Exception as _e:
-                        log.debug('[solver] imu calib pair error: %s', _e)
-                _imu_calib_state['prev_q']    = q_now
-                _imu_calib_state['prev_ra']   = ra_deg
-                _imu_calib_state['prev_dec']  = dec_deg
-                _imu_calib_state['prev_roll'] = roll_deg
+        # continuous capture into the next rotation slot
+        write_idx = _pick_write_slot(last_published)
+        arr = _capture()
+        np.copyto(slot_bufs[write_idx], arr)
 
+        # Publish: update latest_slot and bump frame_seq. The order matters:
+        # incrementing the sequence *after* updating the slot index means
+        # the solver's "read seq, copy, re-read seq" consistency check will
+        # correctly detect a mid-copy write.
+        with latest_slot.get_lock():
+            latest_slot.value = write_idx
+        with frame_seq.get_lock():
+            frame_seq.value  += 1
+
+        last_published = write_idx
+        frame_ready.set()
+        time.sleep(0.05)
+
+# ===========================================================================
+# PROCESS 2 - Solver (tetra3rs)
+# ===========================================================================
+def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
+                   lx200_cmd_q, lx200_result_q,
+                   shared_ra, shared_dec, offset_flag, test_mode,
+                   latest_slot, frame_seq):
+    """
+    Owns tetra3rs database.
+    Continuous loop: wait for frame -> solve -> update shared_ra/shared_dec.
+    Also handles on-demand commands from lx200_cmd_q.
+
+    Reads frames from one of three SHM slots; `latest_slot` tells which
+    slot is current, `frame_seq` is the monotonic frame number. We track
+    `last_solved_seq` so we never redundantly solve the same frame.
+    """
+    _pin_cpu('solver')
+    import tetra3rs
+    import serial as _pyserial
+    from threading import Thread as _Thread, Lock as _Lock
+    from queue import Queue as _ThreadQueue, Empty as _QueueEmpty, Full as _QueueFull
+    from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageOps
+
+    param = load_param()
+    coordinates = Coordinates()
+
+    # Attach to all three SHM slots — we pick which one to copy from at
+    # each iteration based on latest_slot's value.
+    shms      = [shared_memory.SharedMemory(name=n) for n in shm_names]
+    slot_bufs = [np.ndarray((FRAME_H, FRAME_W), dtype=np.uint8, buffer=s.buf)
+                 for s in shms]
+
+    # Track last solved frame sequence so we don't re-solve the same frame
+    # if the main loop wakes up more often than the camera publishes.
+    last_solved_seq = 0
+
+    # --- load database ---
+    DB_PATH = os.path.join(home_path, 'Solver/efinder-tetra-database.bin')
+    print('[solver] loading tetra3rs database...')
+    db = tetra3rs.SolverDatabase.load_from_file(DB_PATH)
+    print('[solver] tetra3rs ready  stars=%d  patterns=%d  max_fov=%.1f°' % (
+        db.num_stars, db.num_patterns, db.max_fov_deg))
+
+    # --- prewarm (item 9) ---
+    # Force Rust-side scratch buffer allocation before the first real frame.
+    # Synthesise a tiny list of centroids; we don't care if the solve itself
+    # succeeds, only that the extraction/solve code paths have been exercised.
+    try:
+        _prewarm_img = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)
+        # A handful of bright pixels so extract_centroids has something to find.
+        for (y, x) in [(100, 120), (200, 300), (300, 500), (400, 200),
+                       (500, 700), (600, 400), (250, 800), (350, 600)]:
+            _prewarm_img[y-1:y+2, x-1:x+2] = 255
+        _ext = tetra3rs.extract_centroids(_prewarm_img, sigma_threshold=10.0,
+                                          max_centroids=20)
+        try:
+            db.solve_from_centroids(_ext.centroids,
+                                    fov_estimate_deg=CAM_FOV_DEG,
+                                    fov_max_error_deg=1.0,
+                                    image_shape=(FRAME_H, FRAME_W),
+                                    solve_timeout_ms=500)
+        except Exception:
+            pass   # a failed synthetic solve still allocates scratch
+        del _prewarm_img, _ext
+        print('[solver] prewarm complete')
+    except Exception as e:
+        print('[solver] prewarm skipped:', e)
+
+    try:
+        fnt = ImageFont.truetype(os.path.join(home_path, "Solver/text.ttf"), 16)
+    except Exception:
+        fnt = ImageFont.load_default()
+
+    # --- frame saving flags (for bench-test capture) ---
+    _save_solved_frames = param.get('save_solved_frames', 'false').lower() == 'true'
+    _save_failed_frames = param.get('save_failed_frames', 'false').lower() == 'true'
+    _failed_frames_dir = param.get('failed_frames_dir',
+                                   os.path.join(home_path, 'Solver/failed_frames'))
+
+    def _save_frame_png(np_arr, label):
+        from datetime import datetime as _dt
+        try:
+            os.makedirs(_failed_frames_dir, exist_ok=True)
+            ts = _dt.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            path = os.path.join(_failed_frames_dir, 'capture_%s_%s.png' % (ts, label))
+            Image.fromarray(np_arr, mode='L').save(path)
+            print('[solver] Saved frame: %s' % path)
+        except Exception as e:
+            print('[solver] Could not save frame: %s' % e)
+
+    # --- FOV calibration ---
+    _fov_samples  = []
+    _FOV_MIN, _FOV_MAX = 5, 20
+    _fov_measured = float(param.get('fov_measured', '0'))
+
+    def _get_fov():
+        if _fov_measured > 0 and len(_fov_samples) >= _FOV_MIN:
+            return _fov_measured, 0.3
+        return CAM_FOV_DEG, 1.0
+
+    def _update_fov(fov_deg):
+        nonlocal _fov_measured
+        if not fov_deg or fov_deg <= 0: return
+        _fov_samples.append(fov_deg)
+        if len(_fov_samples) > _FOV_MAX: _fov_samples.pop(0)
+        if len(_fov_samples) < _FOV_MIN: return
+        avg = sum(_fov_samples) / len(_fov_samples)
+        if abs(avg - _fov_measured) > 0.05:
+            _fov_measured = avg
+            param['fov_measured'] = '%.4f' % avg
+            save_param(param)
+            print('[solver] FOV calibrated: %.3f deg' % avg)
+
+    # --- offset in centred pixel space (tetra3rs convention) ---
+    # d_x / d_y stored as arcminutes in config (on-sky).
+    def _build_offset():
+        dx_deg = float(param.get("d_x", "0")) / 60.0
+        dy_deg = float(param.get("d_y", "0")) / 60.0
+        return dxdy2centred(dx_deg, dy_deg)   # (cx, cy) centred pixels
+
+    offset_cx, offset_cy = _build_offset()
+
+    MAX_CENTROIDS          = 20
+    SEEDED_TIMEOUT_MS      = 2000
+    BLIND_TIMEOUT_MS       = 5000
+    RESEED_TOLERANCE_DEG   = 4.0   # how close a new solve must be to trust the seed
+
+    # --- Centroid peak-value attribute probe ---
+    # Documented attribute on tetra3rs Centroid: `brightness` (integrated
+    # intensity above background). Earlier experimental bindings exposed
+    # it under other names; we probe a short list so the code works across
+    # versions. Note: `brightness` / `mass` are INTEGRATED intensity, not
+    # peak. `img_peak` in _do_solve uses the windowed np.max path instead,
+    # which is the correct 0-255 peak. This attribute is only the fallback
+    # when an image isn't passed to _centroid_peak.
+    _PEAK_ATTR = None
+    try:
+        # Synthetic image with a few bright patches so extract_centroids
+        # reliably returns at least one Centroid. Use 3x3 blocks rather
+        # than single pixels — some centroid extractors require a local
+        # neighborhood above threshold, not just one hot pixel.
+        _probe_img = np.zeros((40, 40), dtype=np.uint8)
+        for (_y, _x) in [(10, 10), (20, 30), (30, 15)]:
+            _probe_img[_y-1:_y+2, _x-1:_x+2] = 255
+        _probe_extraction = tetra3rs.extract_centroids(
+            _probe_img, sigma_threshold=3.0, max_centroids=5,
+        )
+        if len(_probe_extraction.centroids) > 0:
+            _c = _probe_extraction.centroids[0]
+            for _name in ('brightness', 'mass', 'peak_val', 'peak_value', 'peak', 'intensity'):
+                if hasattr(_c, _name) and getattr(_c, _name) is not None:
+                    _PEAK_ATTR = _name
+                    break
+            print('[solver] centroid peak attribute: %r' % _PEAK_ATTR)
+        else:
+            print('[solver] centroid peak probe: no centroids from synthetic image')
+    except Exception as _e:
+        print('[solver] centroid peak probe failed:', _e)
+
+    def _centroid_peak(centroid_list, np_img=None):
+        """Peak intensity (0-255) of the brightest centroid.
+
+        Primary path: read a 5x5 window around the brightest centroid's
+        pixel location from np_img and take the max. This gives actual
+        8-bit pixel intensity — what the log messages and auto_exp
+        saturation check were designed around — without scanning the
+        whole frame (25 pixels instead of 730K).
+
+        Fallback: the cached centroid attribute (_PEAK_ATTR). Note that
+        on tetra3rs 0.6.0 this resolves to `mass`, which is integrated
+        intensity, not peak. Only useful as a relative brightness proxy
+        when np_img isn't available.
+
+        Returns 0 if the list is empty or neither path works.
+        """
+        if not centroid_list:
+            return 0
+        if np_img is not None:
+            try:
+                # centroid coords are centred (origin = image centre,
+                # +X right, +Y down — tetra3rs convention). Convert to
+                # top-left-origin indexing for the numpy array.
+                cx = centroid_list[0].x
+                cy = centroid_list[0].y
+                row = int(round(CENTRE_Y + cy))
+                col = int(round(CENTRE_X + cx))
+                r0, r1 = max(0, row - 2), min(FRAME_H, row + 3)
+                c0, c1 = max(0, col - 2), min(FRAME_W, col + 3)
+                if r1 > r0 and c1 > c0:
+                    return int(np_img[r0:r1, c0:c1].max())
+            except Exception:
+                pass   # fall through to attribute path
+        if _PEAK_ATTR is not None:
+            try:
+                return int(getattr(centroid_list[0], _PEAK_ATTR))
+            except Exception:
+                pass
+        return 0
+
+    # solver state
+    solve         = False
+    solved_radec  = (0.0, 0.0)
+    solution      = None
+    centroids_last = []
+    firstCentroid = None
+    stars         = '0'
+    peak          = '0'
+    eTime         = '00.00'
+    keep          = False
+    frame_n       = 0
+    offset_str    = '%1.3f,%1.3f' % (0.0, 0.0)
+
+    # --- background state-writer (item 10) ---
+    # Collect state into an in-memory dict on the hot path; flush it to
+    # /dev/shm at 2 Hz from a daemon thread. Saves the JSON serialize +
+    # write + fsync cost from the solve loop.
+    _state_snapshot = {}
+    _state_lock     = _Lock()
+    _state_dirty   = False
+
+    def _snapshot_state():
+        """Hot-path: just stage the state dict, don't write."""
+        nonlocal _state_dirty
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp') as f:
+                cpu_temp = int(f.read()) / 1000.0
+        except Exception:
+            cpu_temp = 0.0
+        try:
+            with open('/proc/self/status') as f:
+                mem_kb = next(l for l in f if l.startswith('VmRSS:'))
+            memory_mb = int(mem_kb.split()[1]) // 1024
+        except Exception:
+            memory_mb = 0
+        s = {
+            'ra':              solved_radec[0] / 15.0,
+            'dec':             solved_radec[1],
+            'solve_status':    'Solved' if solve else 'No solve',
+            'solve_timestamp': int(time.time()),
+            'stars':           stars,
+            'peak':            peak,
+            'exposure':        param.get('Exposure', '?'),
+            'gain':            param.get('Gain', '?'),
+            'solve_time':      eTime,
+            'version':         version,
+            'fov_measured':    round(_fov_measured, 3) if _fov_measured > 0 else None,
+            'fov_samples':     len(_fov_samples),
+            'offset_str':      offset_str,
+            'cpu_temp':        round(cpu_temp, 1),
+            'memory_usage':    memory_mb,
+        }
+        with _state_lock:
+            _state_snapshot.clear()
+            _state_snapshot.update(s)
+            _state_dirty = True
+
+    def _write_state():
+        """Back-compat wrapper kept for the measure_offset / reset_offset
+        paths that expect a promptly-visible state file. Equivalent to
+        the in-memory snapshot pattern; the background thread will flush
+        within ~0.5 s, which is fine for those non-hot-path callers."""
+        _snapshot_state()
+
+    def _state_writer_thread():
+        nonlocal _state_dirty
+        last_flush = 0.0
+        while True:
+            time.sleep(0.5)   # 2 Hz flush cadence
+            with _state_lock:
+                if not _state_dirty:
+                    continue
+                snap = dict(_state_snapshot)
+                _state_dirty = False
+            try:
+                # Atomic-ish: write to temp then rename. /dev/shm is tmpfs
+                # so rename is cheap and avoids readers seeing half a file.
+                tmp = STATE_FILE + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(snap, f)
+                os.replace(tmp, STATE_FILE)
+                last_flush = time.time()
+            except Exception as e:
+                print('[solver] state flush failed:', e)
+
+    _Thread(target=_state_writer_thread, daemon=True,
+            name='eFinder-state').start()
+
+    # --- background live-image writer (item 11) ---
+    # The live JPEG render is the single largest hidden cost in the solve
+    # loop (Pillow contrast + rotate + JPEG encode on a 960x760 array is
+    # easily 40-80ms on a Pi Zero 2W). Offload it to a thread with a
+    # size-1 queue so the solver never blocks, and the renderer always
+    # works on the newest available frame.
+    _live_q = _ThreadQueue(maxsize=1)
+
+    def _live_writer_thread():
+        while True:
+            try:
+                arr, overlay = _live_q.get()
+            except Exception:
+                continue
+            if arr is None:
+                continue
+            try:
+                lo = float(np.percentile(arr, 1))
+                hi = float(np.percentile(arr, 99))
+                if hi - lo >= 4:
+                    stretched = np.clip(
+                        (arr.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255
+                    ).astype(np.uint8)
+                else:
+                    stretched = arr
+                img  = Image.fromarray(stretched)
+                img2 = img.rotate(angle=180)
+                if overlay is not None:
+                    d = ImageDraw.Draw(img2)
+                    d.text((5, 5), overlay, font=fnt, fill='white')
+                tmp = LIVE_IMAGE + '.tmp'
+                img2.save(tmp, format='JPEG')
+                os.replace(tmp, LIVE_IMAGE)
+            except Exception as e:
+                print('[solver] live image write failed:', e)
+
+    _Thread(target=_live_writer_thread, daemon=True,
+            name='eFinder-live').start()
+
+    def _write_live(arr):
+        """Hot-path: hand the frame to the render thread. Drops any backlog
+        so the renderer always operates on the newest frame; if it falls
+        behind we simply skip the older one rather than queuing it up."""
+        if solve and solution is not None:
+            overlay = 'RA %s  Dec %s  Stars %s  %.2fs' % (
+                coordinates.hh2dms(solved_radec[0] / 15),
+                coordinates.dd2aligndms(solved_radec[1]),
+                stars, float(eTime))
+        else:
+            overlay = None
+        # arr is already a copy (from the triple-buffer read in the main
+        # loop), so passing it across the thread boundary is safe.
+        try:
+            _live_q.put_nowait((arr, overlay))
+        except _QueueFull:
+            # Drop the previous pending frame and push the new one.
+            try:
+                _live_q.get_nowait()
+            except _QueueEmpty:
+                pass
+            try:
+                _live_q.put_nowait((arr, overlay))
+            except _QueueFull:
+                pass
+
+    def _save_debug(arr, txt):
+        nonlocal frame_n, keep
+        frame_n += 1
+        img  = Image.fromarray(arr)
+        img2 = ImageEnhance.Contrast(img).enhance(5)
+        img2 = img2.rotate(angle=180)
+        d    = ImageDraw.Draw(img2)
+        d.text((70, 5), txt + "      Frame %d" % frame_n, font=fnt, fill='white')
+        img2 = ImageOps.expand(img2, border=5, fill='red')
+        img2.save(os.path.join(home_path, 'Solver/images/capture.jpg'))
+        if frame_n > 100:
+            keep = False; frame_n = 0
+
+    def _do_solve(img):
+        nonlocal solve, solved_radec, solution, firstCentroid, centroids_last
+        nonlocal stars, peak, eTime
+
+        t0 = time.time()
+        np_img = img if img.dtype == np.uint8 else img.astype(np.uint8)
+
+        # tetra3rs centroid extraction — returns ExtractionResult with
+        # centroids already in centred pixel space, brightest first.
+        extraction = tetra3rs.extract_centroids(
+            np_img,
+            sigma_threshold=10.0,
+            max_centroids=MAX_CENTROIDS,
+        )
+        centroid_list = extraction.centroids
+        # Peak brightness is read as the max of a 5x5 window around the
+        # brightest centroid — actual 8-bit pixel intensity, scoped to 25
+        # pixels instead of a full-frame np.max() scan (~730K elements).
+        img_peak = _centroid_peak(centroid_list, np_img)
+
+        print('[solver] centroids=%d  peak=%d' % (len(centroid_list), img_peak))
+
+        if len(centroid_list) < 15:
+            solve = False
+            if keep:
+                _save_debug(img, "Bad image - %d stars  Exp=%ss Gain=%s" % (
+                    len(centroid_list), param['Exposure'], param['Gain']))
+            return False
+
+        stars = '%4d' % len(centroid_list)
+        peak  = '%3d' % img_peak
+
+        fov_est, fov_err = _get_fov()
+
+        # Tracking mode: when we have a recent successful solve, pass its
+        # quaternion as `attitude_hint`. The solver then skips the expensive
+        # 4-star pattern-hash search and does direct correspondence matching
+        # against nearby catalog stars — typically 10-30 ms vs 100-500 ms
+        # for lost-in-space. If the hint is stale (big slew, lost stars,
+        # dome rotation lag), tetra3rs automatically falls back to
+        # lost-in-space since strict_hint=False by default. No manual
+        # retry needed.
+        #
+        # hint_uncertainty_deg sizes the cone search around the hint. For a
+        # well-tracking mount between 200ms frames, actual motion is a few
+        # arcsec; 1° is generous and keeps the cone small. Too tight and a
+        # momentary gust of wind could miss; too wide and we lose the
+        # speedup. 1° is a good starting point.
+        kwargs = dict(
+            fov_estimate_deg  = fov_est,
+            fov_max_error_deg = fov_err,
+            image_shape       = (FRAME_H, FRAME_W),
+            solve_timeout_ms  = BLIND_TIMEOUT_MS,
+        )
+        if solve and solution is not None:
+            try:
+                kwargs['attitude_hint']        = solution.quaternion
+                kwargs['hint_uncertainty_deg'] = 1.0
+                kwargs['solve_timeout_ms']     = SEEDED_TIMEOUT_MS
+            except Exception as _hint_e:
+                # Older tetra3rs without tracking mode — ignore the hint and
+                # fall back to lost-in-space. Logged once at startup would
+                # be nicer than per-frame, but the cost is negligible.
+                print('[solver] attitude_hint not supported:', _hint_e)
+                kwargs.pop('attitude_hint', None)
+                kwargs.pop('hint_uncertainty_deg', None)
+
+        sol = db.solve_from_centroids(centroid_list, **kwargs)
+
+        eTime = ('%2.2f' % (time.time() - t0)).zfill(5)
+
+        if sol is None:
+            solve = False
+            print('[solver] No solve: centroids=%d peak=%d fov_est=%.4f fov_err=%.4f' % (
+                len(centroid_list), img_peak, fov_est, fov_err))
+            if _save_failed_frames:
+                _save_frame_png(np_img, 'failed')
+            if keep:
+                _save_debug(img, "Not Solved - %s stars  Exp=%ss Gain=%s" % (
+                    stars, param['Exposure'], param['Gain']))
+            return False
+
+        solution       = sol
+        centroids_last = centroid_list
+        firstCentroid  = centroid_list[0]   # brightest
+
+        # sol.ra_deg / sol.dec_deg are the J2000 boresight.
+        # pixel_to_world maps any pixel (centred coords) into J2000 RA/Dec —
+        # this is the honest way to apply the offset, since tetra3rs does
+        # the focal-plane projection (with parity_flip correction) internally.
+        try:
+            target = sol.pixel_to_world(offset_cx, offset_cy)
+        except Exception:
+            target = None
+        if target is None:
+            target_ra_deg, target_dec_deg = sol.ra_deg, sol.dec_deg
+        else:
+            target_ra_deg, target_dec_deg = target
+
+        _update_fov(sol.fov_deg)
+
+        # Precess J2000 -> JNow
+        ra, dec = coordinates.precess(target_ra_deg, target_dec_deg)
+
+        if _save_solved_frames:
+            _save_frame_png(np_img, 'solved')
+        if keep:
+            _save_debug(img, "Peak=%d  Stars=%s  Exp=%ss Gain=%s" % (
+                img_peak, stars, param['Exposure'], param['Gain']))
+
+        solved_radec = (ra, dec)
+        solve = True
+
+        # Zero-copy hot path — SkySafari :GR/:GD read these directly.
+        shared_ra.value  = ra
+        shared_dec.value = dec
+
+        try:
+            print('[solver] JNow', coordinates.hh2dms(ra / 15),
+                  coordinates.dd2aligndms(dec),
+                  '  solve=%.1fms' % sol.solve_time_ms)
+        except Exception:
+            print('[solver] JNow', coordinates.hh2dms(ra / 15),
+                  coordinates.dd2aligndms(dec))
+        _snapshot_state()   # hot path — in-memory only, bg thread flushes
+
+        if _MOUNT_MODE != 'none':
+            _Thread(target=_push_mount, args=(ra, dec), daemon=True).start()
         return True
 
-    def _set_camera(exp, gn, persist=True):
+    # --- mount push (ported from tiny_img) ---
+    _MOUNT_MODE   = param.get('mount_mode', 'none').lower().strip()
+    _MOUNT_HOST   = param.get('mount_host', '192.168.0.1').strip()
+    _MOUNT_PORT   = int(param.get('mount_port', '9999'))
+    _MOUNT_SERIAL = param.get('mount_serial', '/dev/ttyAMA0').strip()
+    _MOUNT_BAUD   = int(param.get('mount_baud', '9600'))
+    _mount_lock   = _Lock()
+    _mount_sock   = None
+    _mount_ser    = None
+
+    def _fmt_ra(deg):
+        h  = (deg / 15.0) % 24.0
+        hh = int(h); mm = int((h - hh) * 60); ss = int(((h - hh) * 60 - mm) * 60)
+        return '%02d:%02d:%02d' % (hh, mm, ss)
+
+    def _fmt_dec(deg):
+        s = '+' if deg >= 0 else '-'; d = abs(deg)
+        dd = int(d); mm = int((d - dd) * 60); ss = int(((d - dd) * 60 - mm) * 60)
+        return '%s%02d*%02d:%02d' % (s, dd, mm, ss)
+
+    def _connect_mount():
+        nonlocal _mount_sock, _mount_ser
+        if _MOUNT_MODE == 'wifi':
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3.0); s.connect((_MOUNT_HOST, _MOUNT_PORT))
+                s.settimeout(1.0)
+                _mount_sock = s
+                print('[solver] mount (WiFi) connected')
+            except Exception as e:
+                print('[solver] mount not reachable:', e)
+        elif _MOUNT_MODE == 'serial':
+            try:
+                _mount_ser = _pyserial.Serial(
+                    _MOUNT_SERIAL, _MOUNT_BAUD, timeout=1.0, write_timeout=1.0)
+                print('[solver] mount (serial) connected')
+            except Exception as e:
+                print('[solver] mount serial not available:', e)
+
+    def _push_mount(ra, dec):
+        nonlocal _mount_sock, _mount_ser
+        ra_s = _fmt_ra(ra); dec_s = _fmt_dec(dec)
+        with _mount_lock:
+            try:
+                if _MOUNT_MODE == 'wifi' and _mount_sock:
+                    for cmd in [':Sr%s#' % ra_s, ':Sd%s#' % dec_s, ':CM#']:
+                        _mount_sock.sendall(cmd.encode('ascii'))
+                        _mount_sock.recv(64)
+                elif _MOUNT_MODE == 'serial' and _mount_ser:
+                    for cmd in [':Sr%s#' % ra_s, ':Sd%s#' % dec_s, ':CM#']:
+                        _mount_ser.reset_input_buffer()
+                        _mount_ser.write(cmd.encode('ascii'))
+                        time.sleep(0.1)
+            except Exception as e:
+                print('[solver] mount sync failed:', e)
+                try:
+                    if _mount_sock: _mount_sock.close()
+                    if _mount_ser:  _mount_ser.close()
+                except Exception: pass
+                _mount_sock = _mount_ser = None
+                _Thread(target=_connect_mount, daemon=True).start()
+
+    if _MOUNT_MODE != 'none':
+        _connect_mount()
+
+    # --- camera helpers ---
+    def _request_capture():
+        cam_cmd_q.put(('capture_once', None, None))
+        try:
+            _, arr = cam_result_q.get(timeout=10.0)
+            return arr
+        except Exception:
+            # Fallback: grab whichever slot camera published most recently.
+            # Less fresh than an on-demand capture, but always available.
+            return slot_bufs[latest_slot.value].copy()
+
+    def _set_camera(exp, gain):
         param['Exposure'] = str(exp)
-        param['Gain']     = str(gn)
-        if persist:
-            save_param(param)
-        cam_cmd_q.put(('set_exp', exp, gn))
+        param['Gain']     = str(gain)
+        save_param(param)
+        cam_cmd_q.put(('set_exp', exp, gain))
 
-    def _do_auto_exp():
-        """Closed-loop exposure adjustment based on detected star count."""
-        nc     = _auto_exp_state['last_stars']
-        target = int(param.get('AutoExpTargetStars', '20'))
-        mn     = float(param.get('AutoExpMin', '0.05'))
-        mx     = float(param.get('AutoExpMax', '4.0'))
-        exp    = float(param.get('Exposure', '0.2'))
-        now    = time.monotonic()
-        if now - _auto_exp_state['last_adj'] < 5.0:
-            return
-        if nc < max(1, int(target * 0.6)) and exp < mx:
-            new_exp = min(mx, round(exp * 1.4, 3))
-            _set_camera(new_exp, float(param.get('Gain', '20')), persist=False)
-            _auto_exp_state['last_adj'] = now
-            log.debug('[solver] auto_exp up:   %d stars exp %.3f->%.3f', nc, exp, new_exp)
-        elif nc > target * 2 and exp > mn:
-            new_exp = max(mn, round(exp * 0.7, 3))
-            _set_camera(new_exp, float(param.get('Gain', '20')), persist=False)
-            _auto_exp_state['last_adj'] = now
-            log.debug('[solver] auto_exp down: %d stars exp %.3f->%.3f', nc, exp, new_exp)
-
-    _star_name_dict = {}
-    try:
-        with open(os.path.join(home_path, 'Solver/starnames.csv')) as _f:
-            for _row in csv.reader(_f):
-                if len(_row) >= 3:
-                    _star_name_dict[str(_row[1]).strip()] = (
-                        _row[0].strip(),
-                        (' (%s)' % _row[2].strip()) if _row[2].strip() else '',
-                    )
-    except Exception:
-        pass
-
+    # --- star name lookup ---
     def _lookup_star(catalog_id):
-        hipId = str(abs(int(catalog_id)))
-        name, sn = _star_name_dict.get(hipId, ('', ''))
+        hipId = str(abs(int(catalog_id)))   # negative IDs = Hipparcos gap-fill
+        name = sn = ''
+        try:
+            with open(os.path.join(home_path, 'Solver/starnames.csv')) as f:
+                for row in csv.reader(f):
+                    if str(row[1]) == hipId:
+                        name = row[0].strip()
+                        sn = (' (%s)' % row[2].strip()) if row[2].strip() else ''
+                        break
+        except Exception: pass
         return name, sn, hipId
 
+    # --- on-demand command handler ---
     def _handle(cmd, a, b):
         nonlocal solve, solved_radec, offset_cx, offset_cy, offset_str
-        nonlocal keep, frame_n, _fov_measured, _detect_sigma
+        nonlocal keep, frame_n
 
         if cmd == 'adj_exp':
             new_exp = '%.1f' % max(0.1, float(param.get('Exposure','0.2'))
@@ -678,101 +941,21 @@ def solver_worker(
             _set_camera(new_exp, param.get('Gain','20'))
             return new_exp
 
+        elif cmd == 'adj_gain':
+            g = max(0, min(50, float(param.get('Gain','20')) + float(a) * 5))
+            _set_camera(param.get('Exposure','0.2'), '%.1f' % g)
+            return '%.1f' % g
+
+        elif cmd == 'select_exp':
+            _set_camera(a, b); return '1'
+
         elif cmd == 'set_exp':
-            persist = bool(b) if b is not None else True
-            _set_camera(a, param.get('Gain', '20'), persist=persist)
-            return 'ok'
-
-        elif cmd == 'get_param':
-            return json.dumps(param)
-
-        elif cmd == 'set_param':
-            k, v = str(a), str(b)
-            param[k] = v
-            save_param(param)
-            return 'ok'
-
-        elif cmd == 'get_result':
-            try:
-                with open(result_path) as f:
-                    return f.read()
-            except Exception:
-                return '{}'
-
-        elif cmd == 'solve_now':
-            try:
-                img = _request_capture()
-                ok  = _do_solve(img)
-                return '1' if ok else '0'
-            except Exception as e:
-                return 'err:%s' % e
-
-        elif cmd == 'pause_solve':
-            solve = False; return 'ok'
-
-        elif cmd == 'resume_solve':
-            solve = True;  return 'ok'
-
-        elif cmd == 'set_offset':
-            offset_cx, offset_cy = float(a), float(b)
-            offset_str = 'cx=%.1f cy=%.1f' % (offset_cx, offset_cy)
-            offset_flag.value = True
-            return 'ok'
-
-        elif cmd == 'clear_offset':
-            offset_cx = offset_cy = 0.0
-            offset_str = 'no offset'
-            offset_flag.value = False
-            param.pop('OffsetCX', None)
-            param.pop('OffsetCY', None)
-            save_param(param)
-            return 'ok'
-
-        elif cmd == 'set_lat':
-            try:
-                lat = float(a)
-                param['Latitude'] = str(lat)
-                save_param(param)
-                _polar.set_latitude(lat)
-                return 'ok'
-            except Exception as e:
-                return 'err:%s' % e
-
-        elif cmd == 'align':
-            # a = target RA degrees (str), b = target Dec degrees (str)
-            # Plate-solve with offset disabled to get raw frame centre,
-            # then compute pixel offset from centre to target star.
-            try:
-                ra_t  = float(a)
-                dec_t = float(b)
-                prev_flag = offset_flag.value
-                offset_flag.value = False
-                img = _request_capture()
-                ok  = _do_solve(img)
-                if not ok:
-                    offset_flag.value = prev_flag
-                    return 'fail:no_solve'
-                ra_c, dec_c = solved_radec
-                ps = (_fov_measured or float(param.get('FOV', '5.0'))) / FRAME_H
-                cos_dec = math.cos(math.radians(dec_c))
-                dra     = ((ra_t - ra_c + 180) % 360) - 180
-                offset_cx = dra * cos_dec / ps
-                offset_cy = (dec_t - dec_c) / ps
-                offset_str = 'boresight cx=%.1f cy=%.1f' % (offset_cx, offset_cy)
-                offset_flag.value = True
-                param['OffsetCX'] = '%.4f' % offset_cx
-                param['OffsetCY'] = '%.4f' % offset_cy
-                save_param(param)
-                log.info('[solver] boresight set: cx=%.1f cy=%.1f (ra_t=%.4f dec_t=%.4f)',
-                         offset_cx, offset_cy, ra_t, dec_t)
-                return 'ok'
-            except Exception as _e:
-                log.warning('[solver] align error: %s', _e)
-                return 'fail:%s' % _e
+            _set_camera(float(a), param.get('Gain','20')); return '1'
 
         elif cmd == 'auto_exp':
-            img = _request_capture()
             exp = float(param.get('Exposure','0.2'))
+            _set_camera(exp, param.get('Gain','20'))
+            img = _request_capture()
             for _ in range(20):
                 ext = tetra3rs.extract_centroids(img, sigma_threshold=10.0,
                                                  max_centroids=MAX_CENTROIDS)
@@ -795,784 +978,390 @@ def solver_worker(
 
         elif cmd == 'measure_offset':
             offset_flag.value = True
-            img = _request_capture()
-            ok = _do_solve(img)
+            ok = _do_solve(_request_capture())
             if not ok:
                 offset_flag.value = False; return 'fail'
-            exp = float(param.get('Exposure', '0.2'))
-            ext = tetra3rs.extract_centroids(img, sigma_threshold=_detect_sigma,
-                                             max_centroids=MAX_CENTROIDS)
-            peak = _centroid_peak(ext.centroids, img)
-            while peak < 200 and exp < 4.0:
-                exp = min(4.0, exp * 1.5)
-                _set_camera(exp, param.get('Gain', '20'))
-                img = _request_capture()
-                ok = _do_solve(img)
-                if not ok:
-                    offset_flag.value = False; return 'fail'
-                ext = tetra3rs.extract_centroids(img, sigma_threshold=_detect_sigma,
-                                                 max_centroids=MAX_CENTROIDS)
-                peak = _centroid_peak(ext.centroids, img)
-            return offset_str
+            exp = float(param.get('Exposure','0.2'))
+            while float(peak) > 255:
+                exp *= 0.75
+                _set_camera(exp, param.get('Gain','20'))
+                ok = _do_solve(_request_capture())
+            if not ok:
+                offset_flag.value = False; return 'fail'
 
-        elif cmd == 'shutdown':
-            keep.value = False; return 'ok'
+            # firstCentroid.x / .y are centred pixel coordinates.
+            cx = firstCentroid.x
+            cy = firstCentroid.y
+            offset_cx = cx
+            offset_cy = cy
+            dx_deg, dy_deg = centred2dxdy(cx, cy)
+            param['d_x'] = '{: .2f}'.format(float(60 * dx_deg))
+            param['d_y'] = '{: .2f}'.format(float(60 * dy_deg))
+            save_param(param)
+            offset_str = '%1.3f,%1.3f' % (dx_deg, dy_deg)
 
-        return 'unknown_cmd'
+            cat_id = solution.matched_catalog_ids[0] if \
+                len(solution.matched_catalog_ids) > 0 else 0
+            name, sn, hipId = _lookup_star(cat_id)
 
-    # ── live JPEG writer thread ──
-    _live_q    = None
-    _live_t    = None
-    _QueueFull = None
-    LIVE_IMAGE = '/dev/shm/efinder_live.jpg'
-    fnt        = None
-    try:
-        from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
-        from queue import Queue as _Queue, Full as _QueueFull, Empty as _QueueEmpty
-        try:
-            fnt = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 14)
-        except Exception:
-            fnt = ImageFont.load_default()
-        _live_q = _Queue(maxsize=2)
-
-        def _live_writer_thread():
-            while True:
-                try:
-                    arr, overlay = _live_q.get()
-                except Exception:
-                    continue
-                if arr is None:
-                    continue
-                try:
-                    img  = Image.fromarray(arr)
-                    img2 = ImageEnhance.Contrast(img).enhance(5)
-                    if overlay is not None:
-                        d = ImageDraw.Draw(img2)
-                        d.text((5, 5), overlay, font=fnt, fill='white')
-                    tmp = LIVE_IMAGE + '.tmp'
-                    img2.save(tmp, format='JPEG')
-                    os.replace(tmp, LIVE_IMAGE)
-                except Exception:
-                    pass
-
-        _live_t = threading.Thread(target=_live_writer_thread, daemon=True)
-        _live_t.start()
-    except ImportError:
-        pass
-
-    def _save_debug(arr, txt):
-        nonlocal frame_n, keep
-        frame_n += 1
-        img  = Image.fromarray(arr)
-        img2 = ImageEnhance.Contrast(img).enhance(5)
-        d    = ImageDraw.Draw(img2)
-        d.text((70, 5), txt + '      Frame %d' % frame_n, font=fnt, fill='white')
-        img2 = ImageOps.expand(img2, border=5, fill='red')
-        img2.save(os.path.join(home_path, 'Solver/images/capture.jpg'))
-        if frame_n > 1100:
-            keep.value = False
-
-    # ── maint Unix socket server thread ──
-    MAINT_SOCK_PATH = '/run/efinder/maint.sock'
-
-    def _dispatch_maint(cmd, args):
-        nonlocal _fov_measured, solve, solved_radec
-
-        if cmd == 'ping':
-            return {'pong': True}
-
-        elif cmd == 'version':
-            return {'version': '1.0.0-tetra3rs_mp'}
-
-        elif cmd == 'status':
-            try:
-                with open(result_path) as _f:
-                    sol = json.load(_f)
-            except Exception:
-                sol = None
-            bs_x = FRAME_W / 2 + offset_cx
-            bs_y = FRAME_H / 2 + offset_cy
-            imu_n       = shared_cfg.get('imu_calib_n', 0)
-            imu_quality = shared_cfg.get('imu_calib_quality', 0.0)
-            imu_avail   = shared_cfg.get('imu_available', False)
-            return {
-                'solution':  sol,
-                'boresight': {'x': bs_x, 'y': bs_y},
-                'fov_deg':   _fov_measured,
-                'solving':   solve,
-                'imu': {
-                    'available': imu_avail,
-                    'calib_n':   imu_n,
-                    'quality':   round(imu_quality, 3),
-                    'active':    imu_avail and imu_n >= 3 and imu_quality >= 0.85,
-                },
-            }
-
-        elif cmd == 'calibration_status':
-            return _calibrator.get_status()
-
-        elif cmd == 'calibration_reset':
-            _calibrator.force_recalibrate()
-            return {'reset': True}
+            offset_flag.value = False
+            _write_state()
+            return name + sn + ',HIP' + hipId + ',' + offset_str
 
         elif cmd == 'reset_offset':
-            return _handle('clear_offset', '', '')
+            offset_cx = 0.0
+            offset_cy = 0.0
+            param['d_x'] = 0; param['d_y'] = 0
+            offset_str = '%1.3f,%1.3f' % (0.0, 0.0)
+            save_param(param); _write_state(); return '1'
 
-        elif cmd == 'boresight_show':
-            return {'x': FRAME_W / 2 + offset_cx, 'y': FRAME_H / 2 + offset_cy}
+        elif cmd == 'start_images':
+            keep = (a == '1'); frame_n = 0 if keep else frame_n
+            print('[solver] image saving:', 'on' if keep else 'off')
+            return '1'
 
-        elif cmd == 'boresight_center':
-            return _handle('clear_offset', '', '')
+        elif cmd == 'date_set':
+            coordinates.dateSet(*a); return '1'
 
-        elif cmd == 'boresight_set':
-            try:
-                y = float(args['y']); x = float(args['x'])
-            except (KeyError, ValueError, TypeError) as e:
-                raise ValueError('boresight_set requires numeric y, x: %s' % e)
-            if not (0 <= y <= FRAME_H) or not (0 <= x <= FRAME_W):
-                raise ValueError('y/x outside frame bounds')
-            cx = x - FRAME_W / 2.0
-            cy = y - FRAME_H / 2.0
-            _handle('set_offset', str(cx), str(cy))
-            param['OffsetCX'] = '%.4f' % cx
-            param['OffsetCY'] = '%.4f' % cy
-            save_param(param)
-            return {'y': y, 'x': x}
+        return 'ok'
 
-        elif cmd == 'exposure_get':
-            return {
-                'exposure_s': float(param.get('Exposure', '0.2')),
-                'gain':       float(param.get('Gain', '20')),
-            }
+    print('[solver] ready, entering main loop')
 
-        elif cmd == 'exposure_set':
-            s = float(args.get('exposure_s', param.get('Exposure', '0.2')))
-            persist = bool(args.get('persist', False))
-            _set_camera(s, float(param.get('Gain', '20')), persist=persist)
-            return {'exposure_s': s}
-
-        elif cmd == 'gain_set':
-            g = float(args.get('gain', param.get('Gain', '20')))
-            persist = bool(args.get('persist', False))
-            _set_camera(float(param.get('Exposure', '0.2')), g, persist=persist)
-            return {'gain': g}
-
-        elif cmd == 'solver_params_get':
-            return {
-                'Sigma':              param.get('Sigma', '8'),
-                'FOV':                param.get('FOV', '5.0'),
-                'AutoExp':            param.get('AutoExp', 'false'),
-                'AutoExpTargetStars': param.get('AutoExpTargetStars', '20'),
-                'AutoExpMin':         param.get('AutoExpMin', '0.05'),
-                'AutoExpMax':         param.get('AutoExpMax', '4.0'),
-                'SolveTimeoutMs':     param.get('SolveTimeoutMs', '1500'),
-            }
-
-        elif cmd == 'solver_params_set':
-            allowed = {'Sigma', 'FOV', 'AutoExp', 'AutoExpTargetStars', 'AutoExpMin', 'AutoExpMax', 'SolveTimeoutMs'}
-            for k, v in args.items():
-                if k in allowed:
-                    if k == 'SolveTimeoutMs':
-                        try:
-                            ms = int(v)
-                        except (ValueError, TypeError) as e:
-                            raise ValueError('SolveTimeoutMs must be integer: %s' % e)
-                        if not (200 <= ms <= 10000):
-                            raise ValueError('SolveTimeoutMs out of range [200, 10000]')
-                    param[k] = str(v)
-                    if k == 'Sigma':
-                        nonlocal _detect_sigma
-                        _detect_sigma = float(v)
-            save_param(param)
-            return {'ok': True}
-
-        elif cmd == 'polar_start':
-            _polar.start()
-            return _polar.get_status()
-
-        elif cmd == 'polar_status':
-            return _polar.get_status()
-
-        elif cmd == 'polar_cancel':
-            _polar.cancel()
-            return _polar.get_status()
-
-        elif cmd == 'polar_set_latitude':
-            lat = float(args.get('latitude_deg', 0.0))
-            param['Latitude'] = str(lat)
-            save_param(param)
-            _polar.set_latitude(lat)
-            return {'latitude_deg': lat}
-
-        else:
-            raise ValueError('unknown maint command: %s' % cmd)
-
-    def _maint_client_thread(conn):
-        buf = b''
+    while True:
+        # drain on-demand commands first
         try:
             while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while b'\n' in buf:
-                    line, _, buf = buf.partition(b'\n')
-                    if not line.strip():
-                        continue
-                    try:
-                        req    = json.loads(line.decode('utf-8'))
-                        cmd    = str(req.get('cmd', ''))
-                        args   = req.get('args') or {}
-                        result = _dispatch_maint(cmd, args)
-                        resp   = json.dumps({'ok': True, 'result': result}) + '\n'
-                    except Exception as e:
-                        resp = json.dumps({'ok': False, 'error': str(e)}) + '\n'
-                    try:
-                        conn.sendall(resp.encode('utf-8'))
-                    except Exception:
-                        break
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _maint_server_thread():
-        sock_dir = os.path.dirname(MAINT_SOCK_PATH)
-        try:
-            os.makedirs(sock_dir, exist_ok=True)
-        except Exception as e:
-            log.warning('[solver] maint: could not create %s: %s', sock_dir, e)
-            return
-        try:
-            os.unlink(MAINT_SOCK_PATH)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            log.warning('[solver] maint: could not unlink stale socket: %s', e)
-        try:
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            srv.bind(MAINT_SOCK_PATH)
-            srv.listen(5)
-            srv.settimeout(1.0)
-            log.info('[solver] maint socket listening at %s', MAINT_SOCK_PATH)
-        except Exception as e:
-            log.error('[solver] maint: failed to bind socket: %s', e)
-            return
-        while keep.value:
-            try:
-                conn, _ = srv.accept()
-                threading.Thread(target=_maint_client_thread, args=(conn,),
-                                 daemon=True).start()
-            except socket.timeout:
-                pass
-            except Exception as e:
-                log.warning('[solver] maint accept error: %s', e)
-        try:
-            srv.close()
-            os.unlink(MAINT_SOCK_PATH)
+                cmd, a, b = lx200_cmd_q.get_nowait()
+                result = _handle(cmd, a, b)
+                lx200_result_q.put((cmd, result))
         except Exception:
             pass
 
-    _maint_t = threading.Thread(target=_maint_server_thread, daemon=True)
-    _maint_t.start()
-
-    # ── main solve loop ──
-    log.info('[solver] started')
-    while keep.value:
-        try:
-            item = cmd_q.get_nowait()
-            cmd, a, b = item if len(item)==3 else (*item, '', '')
-            resp = _handle(cmd, a, b)
-            result_q.put(resp)
-        except Exception:
-            pass
-
-        if not solve:
-            time.sleep(0.1); continue
-
-        try:
-            if not frame_ready.wait(timeout=1.0):
-                continue
+        # wait for a new frame (up to 0.5 s)
+        if frame_ready.wait(timeout=0.5) and not offset_flag.value:
             frame_ready.clear()
-            img = frame.copy()
-            frame_n += 1
-            ok = _do_solve(img)
-            if ok:
-                if param.get('AutoExp', 'false').lower() in ('1', 'true', 'yes'):
-                    _do_auto_exp()
-                if _polar.state not in (PolarState.IDLE, PolarState.DONE, PolarState.ERROR):
-                    _polar.update_from_solve(shared_ra.value, shared_dec.value)
-        except Exception as e:
-            log.warning('[solver] loop error: %s', e)
 
-    shm.close()
-    log.info('[solver] exiting')
+            # Triple-buffered read with sequence consistency check.
+            # 1. Snapshot (slot, seq) — these two may be updated by camera
+            #    between reads, but we only care that the SEQ we record
+            #    belongs to the SLOT we actually copied from.
+            # 2. Copy that slot's contents.
+            # 3. Re-read seq. If it changed, camera published a new frame
+            #    during our copy — we may have read a mix of old+new bytes.
+            #    With 3 slots and camera rotating, the slot we copied from
+            #    is guaranteed not to be the one camera just wrote, so the
+            #    copy is actually consistent; the only thing we missed is
+            #    freshness. Accept the copy but log the skip.
+            seq_before  = frame_seq.value
+            slot_before = latest_slot.value
+            img = slot_bufs[slot_before].copy()
+            seq_after   = frame_seq.value
 
+            if seq_before == last_solved_seq:
+                # Same frame we already solved; woke up spuriously or the
+                # solver outran the camera. Skip without logging noise.
+                continue
 
-# ───────────────────────────────────────────────────────────────────────────────────
-# PROCESS 3 — lx200
-# ───────────────────────────────────────────────────────────────────────────────────
+            skipped = seq_before - last_solved_seq - 1
+            if skipped > 0:
+                # Camera published more frames than we could solve. This is
+                # normal when a solve takes longer than one exposure — log
+                # at low volume so it shows up in profiling but doesn't
+                # spam the journal during steady-state operation.
+                print('[solver] skipped %d frame(s) (seq %d -> %d)' %
+                      (skipped, last_solved_seq, seq_before))
+            if seq_after != seq_before:
+                print('[solver] frame seq changed during copy (%d -> %d) '
+                      '— copy still safe via triple-buffer' %
+                      (seq_before, seq_after))
 
-def lx200_worker(
-    frame_shm_name, frame_ready,
-    shared_ra, shared_dec, offset_flag,
-    keep, test_mode,
-    cmd_q, result_q, cam_cmd_q,
-    shared_cfg,
-    *_extra,
-):
-    import signal, socket
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+            last_solved_seq = seq_before
 
-    param = load_param()
-    _pin_to_cpu(int(param.get('CpuLx200', '1')))
-    host  = param.get('Host', '0.0.0.0')
-    port  = int(param.get('Port', '4030'))
+            _do_solve(img)
+            _write_live(img)
+            print('[solver] ****************')
 
-    _result_ready = threading.Event()
-    _last_result  = [None]
+# ===========================================================================
+# PROCESS 3 - LX200 / WiFi server
+# ===========================================================================
+def lx200_process(lx200_cmd_q, lx200_result_q,
+                  shared_ra, shared_dec, offset_flag, test_mode):
+    """
+    Serves SkySafari on port 4060.
+    Reads ra/dec directly from shared Values - no IPC latency on hot path.
+    Reads other telemetry from /dev/shm/efinder_state.json (non-critical path).
+    Sends tuning/on-demand commands to solver via lx200_cmd_q.
+    """
+    _pin_cpu('lx200')
+    coordinates = Coordinates()
 
-    def _send_cmd(cmd, a='', b='', timeout=2.0):
-        """Send command to solver; block up to timeout seconds for reply."""
-        _result_ready.clear()
-        cmd_q.put((cmd, a, b))
-        _result_ready.wait(timeout=timeout)
-        return _last_result[0]
-
-    def _result_poller():
-        while keep.value:
-            try:
-                r = result_q.get(timeout=0.5)
-                _last_result[0] = r
-                _result_ready.set()
-            except Exception:
-                pass
-
-    threading.Thread(target=_result_poller, daemon=True).start()
-
-    # ── RA/Dec parsing helpers ──
-
-    def _parse_ra_hms(s):
-        """Parse LX200 RA string HH:MM:SS or HH:MM.M to decimal degrees."""
-        s = s.strip()
-        parts = s.replace(':', ' ').split()
-        h   = float(parts[0])
-        m   = float(parts[1]) if len(parts) > 1 else 0.0
-        sec = float(parts[2]) if len(parts) > 2 else 0.0
-        return (h + m / 60.0 + sec / 3600.0) * 15.0
-
-    def _parse_dec_dms(s):
-        """Parse LX200 Dec string sDD*MM:SS or sDD*MM to decimal degrees."""
-        s = s.strip()
-        sign = -1 if s.startswith('-') else 1
-        s = s.lstrip('+-')
-        parts = s.replace('*', ':').replace(':', ' ').split()
-        d   = float(parts[0])
-        m   = float(parts[1]) if len(parts) > 1 else 0.0
-        sec = float(parts[2]) if len(parts) > 2 else 0.0
-        return sign * (d + m / 60.0 + sec / 3600.0)
-
-    def _sync_clock(sl, sg, sc):
-        """Convert SkySafari :SL/:SG/:SC payload to UTC and sync system clock."""
+    def _read_state(key, default=''):
+        """Read a single key from the JSON state file — non-critical path only."""
         try:
-            local_dt = datetime.datetime.strptime('%s %s' % (sc, sl), '%m/%d/%y %H:%M:%S')
-            # LX200 :SG sign: positive = hours west; UTC = local + west_hours
-            utc_dt  = local_dt + datetime.timedelta(hours=float(sg))
-            now_utc = datetime.datetime.utcnow()
-            diff_s  = abs((utc_dt - now_utc).total_seconds())
-            if diff_s < 10:
-                log.debug('[lx200] clock already accurate (drift %.0fs), skipping sync', diff_s)
-                return
-            time_str = utc_dt.strftime('%Y-%m-%d %H:%M:%S')
-            log.info('[lx200] clock drift %.0fs — syncing to %s UTC', diff_s, time_str)
-            subprocess.run(['sudo', 'timedatectl', 'set-ntp', 'false'],
-                           capture_output=True, timeout=5)
-            subprocess.run(['sudo', 'date', '-s', time_str],
-                           capture_output=True, timeout=10)
-            subprocess.run(['sudo', 'hwclock', '-w'],
-                           capture_output=True, timeout=5)
-            subprocess.run(['sudo', 'timedatectl', 'set-ntp', 'true'],
-                           capture_output=True, timeout=5)
-        except Exception as _e:
-            log.warning('[lx200] clock sync error: %s', _e)
+            with open(STATE_FILE) as f:
+                return str(json.load(f).get(key, default))
+        except Exception:
+            return default
 
-    # ── LX200 formatter/parser ──
+    def _cmd(cmd, a=None, b=None, timeout=15.0):
+        lx200_cmd_q.put((cmd, a, b))
+        try:
+            _, result = lx200_result_q.get(timeout=timeout)
+            return str(result)
+        except Exception:
+            return 'err'
 
-    def _ra_to_lx200(ra_deg):
-        h  = ra_deg / 15.0
-        hh = int(h)
-        mm = int((h - hh) * 60)
-        ss = int(((h - hh) * 60 - mm) * 60)
-        return '%02d:%02d:%02d' % (hh, mm, ss)
+    print('[lx200] starting on port 4060')
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('', 4060)); s.listen(50)
+    raStr = decStr = ''
+    timeOffset = '0'; timeStr = '23:00:00'
 
-    def _dec_to_lx200(dec_deg):
-        sign = '+' if dec_deg >= 0 else '-'
-        d  = abs(dec_deg)
-        dd = int(d)
-        mm = int((d - dd) * 60)
-        ss = int(((d - dd) * 60 - mm) * 60)
-        return '%s%02d*%02d:%02d' % (sign, dd, mm, ss)
-
-    def _handle_lx200(data, conn, align_target, time_state):
-        data = data.strip()
-        if not data: return
-
-        def send(s):
-            try: conn.sendall(s.encode())
+    while True:
+        try:
+            client, address = s.accept()
+            # TCP-level tuning for SkySafari's many small :GR/:GD polls:
+            # disable Nagle so each reply flushes immediately rather than
+            # waiting 40 ms for a coalescing partner.
+            try:
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception: pass
+            print('[lx200] debug: client connected from', address)
+            while True:
+                data = client.recv(1024)
+                if not data: break
+                pkt = data.decode('utf-8', 'ignore')
+                # Item 7: previously time.sleep(0.02) — 20 ms of deliberate
+                # latency on every SkySafari poll. Reduced to 1 ms as a
+                # conservative first landing; can be removed entirely once
+                # field-tested. TCP_NODELAY (set above) already handles
+                # Nagle coalescing.
+                time.sleep(0.001)
 
-        # :GR# — get RA (IMU dead-reckoning with fallback)
-        if data == ':GR#':
-            pred = _imu_predict(shared_cfg)
-            if pred is not None:
-                send(_ra_to_lx200(pred[0]) + '#')
-            else:
-                send(_ra_to_lx200(shared_ra.value) + '#')
+                # Hot path: read directly from shared memory — no IPC.
+                ra  = shared_ra.value
+                dec = shared_dec.value
+                raPacket  = coordinates.hh2dms(ra / 15) + '#'
+                decPacket = coordinates.dd2aligndms(dec) + '#'
 
-        # :GD# — get Dec (IMU dead-reckoning with fallback)
-        elif data == ':GD#':
-            pred = _imu_predict(shared_cfg)
-            if pred is not None:
-                send(_dec_to_lx200(pred[1]) + '#')
-            else:
-                send(_dec_to_lx200(shared_dec.value) + '#')
+                for x in pkt.split('#'):
+                    if not x: continue
+                    cmd = x[1:3]
 
-        # :GS# — sidereal time (synthetic)
-        elif data == ':GS#':
-            t  = datetime.datetime.utcnow()
-            hh = (t.hour + t.minute/60 + t.second/3600) % 24
-            send(_ra_to_lx200(hh * 15) + '#')
+                    if   x == ':GR':  client.send(raPacket.encode('ascii'))
+                    elif x == ':GD':  client.send(decPacket.encode('ascii'))
 
-        # :CM# — sync / boresight alignment
-        elif data == ':CM#':
-            ra_t  = align_target.get('ra_deg')
-            dec_t = align_target.get('dec_deg')
-            if ra_t is not None and dec_t is not None:
-                resp = _send_cmd('align', str(ra_t), str(dec_t), timeout=15.0)
-                align_target['ra_deg'] = align_target['dec_deg'] = None
-                if str(resp or '').startswith('ok'):
-                    send('Synced          #')
-                else:
-                    log.warning('[lx200] align failed: %s', resp)
-                    send('Align failed    #')
-            else:
-                _send_cmd('solve_now')
-                send('Synced          #')
+                    elif cmd == 'St': client.send(b'1')
+                    elif cmd == 'Sg': client.send(b'1')
+                    elif cmd == 'SG':
+                        if len(x) > 5:
+                            client.send(b'1'); timeOffset = x[3:]
+                        else:
+                            res = _cmd('adj_gain', x[3:5])
+                            client.send((':SG' + res + '#').encode('ascii'))
+                    elif cmd == 'SL':
+                        client.send(b'1'); timeStr = x[3:]
+                    elif cmd == 'SC':
+                        client.send(b'Updating Planetary Data#                              #')
+                        _cmd('date_set', (timeOffset, timeStr, x[3:]))
+                    elif cmd == 'RG': _cmd('select_exp', 0.1, 10)
+                    elif cmd == 'RC': _cmd('select_exp', 0.1, 20)
+                    elif cmd == 'RM': _cmd('select_exp', 0.2, 20)
+                    elif cmd == 'RS': _cmd('select_exp', 0.5, 30)
+                    elif cmd == 'Sr': raStr = x[3:]; client.send(b'1')
+                    elif cmd == 'Sd': decStr = x[3:]; client.send(b'1')
+                    elif cmd == 'MS': client.send(b'0')
+                    elif cmd == 'Ms': _cmd('adj_exp', -1)
+                    elif cmd == 'Mn': _cmd('adj_exp',  1)
+                    elif cmd == 'Mw': _cmd('start_images', '0')
+                    elif cmd == 'Me': _cmd('start_images', '1')
+                    elif cmd == 'CM':
+                        client.send(b'0')
+                        _cmd('measure_offset', timeout=30.0)
+                        try:
+                            rp = raStr.split(':')
+                            targetRa = int(rp[0]) + int(rp[1])/60 + int(rp[2])/3600
+                            dp = decStr.split('*'); dd = dp[1].split(':')
+                            targetDec = int(dp[0]) + math.copysign(
+                                int(dd[0])/60 + int(dd[1])/3600, float(dp[0]))
+                            print('[lx200] align target:', targetRa, targetDec)
+                        except Exception: pass
+                    elif x and x[-1] == 'Q':
+                        _cmd('start_images', '0')
+                    elif cmd == 'PS':
+                        res = _cmd('go_solve')
+                        client.send((':PS' + res + '#').encode('ascii'))
+                    elif cmd == 'OF':
+                        res = _cmd('measure_offset', timeout=30.0)
+                        client.send((':OF' + res + '#').encode('ascii'))
+                    elif cmd == 'GV':
+                        client.send((':GV' + version + '#').encode('ascii'))
+                    elif cmd == 'GO':
+                        client.send((':GO' + _read_state('offset_str','0,0') + '#').encode('ascii'))
+                    elif cmd == 'SO':
+                        res = _cmd('reset_offset')
+                        client.send((':SO' + res + '#').encode('ascii'))
+                    elif cmd == 'GS':
+                        client.send((':GS' + _read_state('stars','0') + '#').encode('ascii'))
+                    elif cmd == 'GK':
+                        client.send((':GK' + _read_state('peak','0') + '#').encode('ascii'))
+                    elif cmd == 'Gt':
+                        client.send((':Gt' + _read_state('solve_time','00.00') + '#').encode('ascii'))
+                    elif cmd == 'SE':
+                        res = _cmd('adj_exp', x[3:5])
+                        client.send((':SE' + res + '#').encode('ascii'))
+                    elif cmd == 'SX':
+                        res = _cmd('set_exp', x.strip('#')[3:])
+                        client.send((':SX' + res + '#').encode('ascii'))
+                    elif cmd == 'GX':
+                        res = _cmd('auto_exp', timeout=60.0)
+                        client.send((':GX' + res + '#').encode('ascii'))
+                    elif cmd == 'IM':
+                        res = _cmd('start_images', x.strip('#')[3:4])
+                        client.send((':IM' + res + '#').encode('ascii'))
+                    elif cmd == 'TS':
+                        test_mode.value = True
+                        client.send(b':TS1#')
+                    elif cmd == 'TO':
+                        test_mode.value = False
+                        client.send(b':TO1#')
 
-        # :Q# — stop (no-op)
-        elif data == ':Q#':
-            pass
-
-        # :MS# — slew (no-op)
-        elif data == ':MS#':
-            send('0')
-
-        # :GW# — mount status (SkySafari init handshake)
-        elif data == ':GW#':
-            send('AT2#')
-
-        # :GV* — firmware version queries
-        elif data.startswith(':GV'):
-            send('eFinder-tetra3rs#')
-
-        # :GT# — tracking rate
-        elif data == ':GT#':
-            send('60.0#')
-
-        # :Gr# — slew rate
-        elif data == ':Gr#':
-            send('4#')
-
-        # :GA# — altitude
-        elif data == ':GA#':
-            send('+00*00#')
-
-        # :GZ# — azimuth
-        elif data == ':GZ#':
-            send('000*00#')
-
-        # :GC# — date
-        elif data == ':GC#':
-            t = datetime.datetime.utcnow()
-            send('%02d/%02d/%02d#' % (t.month, t.day, t.year % 100))
-
-        # :GL# — local time
-        elif data == ':GL#':
-            t = datetime.datetime.utcnow()
-            send('%02d:%02d:%02d#' % (t.hour, t.minute, t.second))
-
-        # :GG# — UTC offset
-        elif data == ':GG#':
-            send('+0.0#')
-
-        # :Gt# — site latitude
-        elif data == ':Gt#':
-            try:
-                deg = float(param.get('Latitude', '0.0'))
-            except ValueError:
-                deg = 0.0
-            sign = '+' if deg >= 0 else '-'
-            d    = abs(deg)
-            send('%s%02d*%02d#' % (sign, int(d), int((d % 1) * 60)))
-
-        # :Gg# — site longitude
-        elif data == ':Gg#':
-            try:
-                deg = float(param.get('Longitude', '0.0'))
-            except ValueError:
-                deg = 0.0
-            sign = '+' if deg >= 0 else '-'
-            d    = abs(deg)
-            send('%s%03d*%02d#' % (sign, int(d), int((d % 1) * 60)))
-
-        # :St# — set site latitude; parse DMS before storing, propagate to polar aligner
-        elif data.startswith(':St'):
-            raw = data[3:].rstrip('#')
-            try:
-                lat = _parse_dec_dms(raw)
-                param['Latitude'] = str(lat)
-                _send_cmd('set_lat', str(lat))
-            except Exception:
-                param['Latitude'] = raw
-            send('1')
-
-        # :Sg# — set site longitude; parse DMS before storing
-        elif data.startswith(':Sg'):
-            raw = data[3:].rstrip('#')
-            try:
-                lon = _parse_dec_dms(raw)
-                param['Longitude'] = str(lon)
-            except Exception:
-                param['Longitude'] = raw
-            send('1')
-
-        # :SL# — set local time (accumulate for clock sync)
-        elif data.startswith(':SL'):
-            time_state['sl'] = data[3:].rstrip('#').strip()
-            send('1')
-
-        # :SG# — set UTC offset (accumulate for clock sync)
-        elif data.startswith(':SG'):
-            try:
-                time_state['sg'] = float(data[3:].rstrip('#').strip())
-            except ValueError:
-                pass
-            send('1')
-
-        # :SC# — set date; trigger clock sync if :SL and :SG were received
-        elif data.startswith(':SC'):
-            sc_val = data[3:].rstrip('#').strip()
-            sl_val = time_state.get('sl')
-            sg_val = time_state.get('sg')
-            if sl_val and sg_val is not None:
-                threading.Thread(target=_sync_clock,
-                                 args=(sl_val, sg_val, sc_val),
-                                 daemon=True).start()
-            send('1Updating Planetary Data#                              #')
-
-        # :Sr# — set target RA (parse and store for :CM# alignment)
-        elif data.startswith(':Sr'):
-            raw = data[3:].rstrip('#')
-            try:
-                align_target['ra_deg'] = _parse_ra_hms(raw)
-                send('1')
-            except Exception:
-                send('0')
-
-        # :Sd# — set target Dec (parse and store for :CM# alignment)
-        elif data.startswith(':Sd'):
-            raw = data[3:].rstrip('#')
-            try:
-                align_target['dec_deg'] = _parse_dec_dms(raw)
-                send('1')
-            except Exception:
-                send('0')
-
-        # motion commands — no-op
-        elif data.startswith(':M') and data != ':MS#':
-            send('')
-
-        # rate commands — no-op
-        elif data.startswith(':R'):
-            send('')
-
-        # efinder extensions via :X<cmd>#
-        elif data.startswith(':X'):
-            inner = data[2:].rstrip('#').strip()
-            parts = inner.split(None, 2)
-            cmd   = parts[0] if parts else ''
-            a     = parts[1] if len(parts) > 1 else ''
-            b     = parts[2] if len(parts) > 2 else ''
-            resp  = _send_cmd(cmd, a, b)
-            send((resp or '') + '#')
-
-        else:
-            log.debug('[lx200] unknown cmd: %r', data)
-
-    def _client_thread(conn, addr):
-        log.info('[lx200] connect %s', addr)
-        try:
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception:
-            pass
-        try:
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        except Exception:
-            pass  # TCP_KEEPIDLE etc. are Linux-only
-        conn.settimeout(float(param.get('LX200ClientTimeoutS', '30.0')))
-        align_target = {'ra_deg': None, 'dec_deg': None}
-        time_state   = {}
-        buf = ''
-        try:
-            while keep.value:
-                chunk = conn.recv(256)
-                if not chunk: break
-                buf += chunk.decode(errors='replace')
-                while '#' in buf:
-                    cmd, _, buf = buf.partition('#')
-                    _handle_lx200(cmd + '#', conn, align_target, time_state)
-        except socket.timeout:
-            log.debug('[lx200] client %s timed out', addr)
+            print('[lx200] SkySafari disconnected')
         except Exception as e:
-            log.debug('[lx200] client error: %s', e)
-        finally:
-            conn.close()
-        log.info('[lx200] disconnect %s', addr)
+            print('[lx200] server error:', e)
+            try: s.close()
+            except Exception: pass
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('', 4060)); s.listen(50)
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    srv.bind((host, port))
-    srv.listen(5)
-    srv.settimeout(1.0)
-    log.info('[lx200] listening on %s:%d', host, port)
-
-    while keep.value:
-        try:
-            conn, addr = srv.accept()
-            threading.Thread(target=_client_thread, args=(conn, addr),
-                             daemon=True).start()
-        except socket.timeout:
-            pass
-        except Exception as e:
-            log.warning('[lx200] accept error: %s', e)
-
-    srv.close()
-    log.info('[lx200] exiting')
-
-
-# ───────────────────────────────────────────────────────────────────────────────────
-# PROCESS 0 — main / supervisor
-# ───────────────────────────────────────────────────────────────────────────────────
-
+# ===========================================================================
+# MAIN
+# ===========================================================================
 def main():
-    parser = argparse.ArgumentParser(description='eFinder tetra3rs multiprocess')
-    parser.add_argument('--test', action='store_true', help='Synthetic camera (no Pi)')
-    parser.add_argument('--no-update', action='store_true', help='Skip OTA check')
-    args = parser.parse_args()
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser(description='eFinder star-tracker daemon')
+    _tgrp = _parser.add_mutually_exclusive_group()
+    _tgrp.add_argument('--test', action='store_true',
+        help='Test mode: auto-find polaris.png or test.png instead of camera')
+    _tgrp.add_argument('--test-image', metavar='PATH',
+        help='Test mode: use the specified PNG instead of the camera')
+    _parser.add_argument('--kill', action='store_true',
+        help='Kill any running instance first (legacy: pass any arg to kill)')
+    _args, _unknown = _parser.parse_known_args()
 
-    log.info('[main] starting, home=%s', home_path)
+    if _args.kill or (_unknown and not _args.test and not _args.test_image):
+        print('Killing running version')
+        os.system('pkill -9 -f eFinder_tetra3rs_mp.py')
+        time.sleep(1)
 
-    # OTA
-    if not args.no_update:
-        ver, url = check_update()
-        if ver:
-            log.info('[main] update available: %s', ver)
-            try:
-                apply_update(url)
-                log.info('[main] restarting after update')
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except Exception as e:
-                log.warning('[main] update failed: %s', e)
+    test_image_path = None
+    if _args.test_image:
+        _p = Path(_args.test_image)
+        if not _p.exists():
+            print('ERROR: --test-image path not found:', _p)
+            sys.exit(1)
+        test_image_path = str(_p)
+    elif _args.test:
+        _search = [Path.cwd(), Path(home_path) / 'Solver', Path('/var/lib/efinder')]
+        for _name in ('polaris.png', 'test.png'):
+            for _d in _search:
+                _p = _d / _name
+                if _p.exists():
+                    print('Test mode: found', _p)
+                    test_image_path = str(_p)
+                    break
+            if test_image_path:
+                break
+        if not test_image_path:
+            print('ERROR: --test specified but neither polaris.png nor test.png found')
+            sys.exit(1)
 
-    # shared memory
-    shm = shared_memory.SharedMemory(create=True, size=FRAME_BYTES)
+    _pin_cpu('main')
+    print('eFinder version', version)
 
-    # shared state
-    shared_ra   = mp.Value(c_double, 0.0)
-    shared_dec  = mp.Value(c_double, 0.0)
-    offset_flag = mp.Value(c_bool,   False)
-    keep        = mp.Value(c_bool,   True)
-    test_mode   = mp.Value(c_bool,   args.test)
+    # Triple-buffered frame slots. Each is a separate SharedMemory region
+    # of FRAME_SZ bytes; camera rotates writes across them, solver reads
+    # whichever one latest_slot indicates.
+    shms = [shared_memory.SharedMemory(create=True, size=FRAME_SZ)
+            for _ in range(N_FRAME_SLOTS)]
+    shm_names = [s.name for s in shms]
+    print('Frame slots:', shm_names, '(%d bytes each)' % FRAME_SZ)
 
-    # queues
-    cmd_q     = mp.Queue()
-    result_q  = mp.Queue()
-    cam_cmd_q = mp.Queue()
+    # Atomic handoff Values (items 1 + 3).
+    # latest_slot: which slot was most recently fully written.
+    # frame_seq:   monotonic frame counter; solver uses it to detect
+    #              skipped frames and to avoid re-solving the same frame.
+    latest_slot = Value(ctypes.c_int, 0)
+    frame_seq   = Value(ctypes.c_uint64, 0)
 
-    # event
-    frame_ready = mp.Event()
+    # shared Values for hot-path ra/dec — direct memory read, zero IPC
+    shared_ra   = Value(ctypes.c_double, 0.0)
+    shared_dec  = Value(ctypes.c_double, 0.0)
+    offset_flag = Value(ctypes.c_bool, False)
+    test_mode   = Value(ctypes.c_bool, test_image_path is not None)
 
-    # IMU shared state (Manager dict — accessible from all worker processes)
-    mgr = mp.Manager()
-    shared_cfg = mgr.dict({
-        'imu_available':    False,
-        'imu_q':            None,
-        'imu_t':            0.0,
-        'imu_ref_q':        None,
-        'imu_ref_ra_deg':   None,
-        'imu_ref_dec_deg':  None,
-        'imu_ref_t':        0.0,
-        'imu_ref_roll_deg': 0.0,
-        'imu_calib_C':      None,
-        'imu_calib_n':      0,
-        'imu_calib_quality': 0.0,
-    })
+    # queues and events
+    frame_ready    = Event()
+    cam_cmd_q      = Queue()
+    cam_result_q   = Queue()
+    lx200_cmd_q    = Queue()
+    lx200_result_q = Queue()
 
-    shared = (
-        shm.name, frame_ready,
-        shared_ra, shared_dec, offset_flag,
-        keep, test_mode,
-        cmd_q, result_q, cam_cmd_q,
-        shared_cfg,
-    )
+    # Store target/args alongside each Process so the restart logic can
+    # reconstruct them without relying on private _target/_args attributes.
+    proc_specs = {
+        'camera': dict(
+            target=camera_process,
+            args=(shm_names, frame_ready, cam_cmd_q, cam_result_q,
+                  test_mode, latest_slot, frame_seq, test_image_path)),
+        'solver': dict(
+            target=solver_process,
+            args=(shm_names, frame_ready, cam_cmd_q, cam_result_q,
+                  lx200_cmd_q, lx200_result_q,
+                  shared_ra, shared_dec, offset_flag, test_mode,
+                  latest_slot, frame_seq)),
+        'lx200': dict(
+            target=lx200_process,
+            args=(lx200_cmd_q, lx200_result_q,
+                  shared_ra, shared_dec, offset_flag, test_mode)),
+    }
 
-    proc_specs = [
-        {'name': 'camera', 'target': camera_worker},
-        {'name': 'solver', 'target': solver_worker},
-        {'name': 'lx200',  'target': lx200_worker},
-    ]
+    procs = {}
+    for name, spec in proc_specs.items():
+        p = Process(target=spec['target'], args=spec['args'],
+                    name='eFinder-' + name, daemon=True)
+        p.start()
+        procs[name] = p
+        print('Started %s (pid %d)' % (name, p.pid))
 
-    workers = {spec['name']: _start_worker(spec, shared) for spec in proc_specs}
+    time.sleep(2.0)
+    print('eFinder running — SkySafari -> port 4060')
 
     try:
-        while keep.value:
-            time.sleep(HEALTH_POLL)
-            for spec in proc_specs:
-                name = spec['name']
-                p    = workers[name]
+        while True:
+            time.sleep(30)
+            for name, p in list(procs.items()):
                 if not p.is_alive():
-                    cnt = restart_counts[name] + 1
-                    restart_counts[name] = cnt
-                    log.warning('[main] %s died (exit=%s), restart #%d',
-                                name, p.exitcode, cnt)
-                    if cnt > RESTART_LIMIT:
-                        log.error('[main] %s exceeded restart limit, stopping', name)
-                        keep.value = False
-                        break
-                    workers[name] = _start_worker(spec, shared)
+                    print('[main] %s died (exit %s) — restarting' % (name, p.exitcode))
+                    spec = proc_specs[name]
+                    new_p = Process(target=spec['target'], args=spec['args'],
+                                    name='eFinder-' + name, daemon=True)
+                    new_p.start()
+                    procs[name] = new_p
+                    print('[main] %s restarted (pid %d)' % (name, new_p.pid))
     except KeyboardInterrupt:
-        log.info('[main] KeyboardInterrupt — shutting down')
-        keep.value = False
-
-    # tidy up
-    for name, p in workers.items():
-        p.join(timeout=3)
-        if p.is_alive():
-            log.warning('[main] force-terminating %s', name)
+        print('eFinder stopped.')
+    finally:
+        for p in procs.values():
             p.terminate()
-
-    mgr.shutdown()
-    shm.unlink()
-    log.info('[main] done')
-
+        for s in shms:
+            try: s.close()
+            except Exception: pass
+            try: s.unlink()
+            except Exception: pass
 
 if __name__ == '__main__':
-    mp.set_start_method('fork')
+    set_start_method('fork')
     main()
