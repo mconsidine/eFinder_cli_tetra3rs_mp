@@ -8,7 +8,7 @@ autoconnect-retries=-1
 
 [wifi]
 mode=ap
-ssid=eFinder
+ssid=efinder
 
 [wifi-security]
 key-mgmt=wpa-psk
@@ -16,7 +16,7 @@ psk=12345678
 
 [ipv4]
 method=shared
-address1=192.168.50.1/24
+address1=10.42.0.1/24
 
 [ipv6]
 method=ignore

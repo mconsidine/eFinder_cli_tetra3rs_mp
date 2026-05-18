@@ -1,0 +1,13 @@
+[Unit]
+Description=eFinder USB Serial Console (ttyGS0)
+After=efinder-usb-gadget.service
+Requires=efinder-usb-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/sbin/agetty --local-line --noclear 115200 ttyGS0 vt100
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
