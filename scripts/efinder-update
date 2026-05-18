@@ -1,0 +1,30 @@
+#!/bin/bash
+# OTA update for eFinder tetra3rs_mp.
+# Upload efinder_update.zip via the web UI (/upload) then press Update.
+# This script applies the zip and restarts efinder.service.
+set -euo pipefail
+
+ZIPFILE=/home/efinder/uploads/efinder_update.zip
+SOLVER_DIR=/home/efinder/Solver
+LOG=/home/efinder/uploads/update_log.txt
+
+exec >> "$LOG" 2>&1
+echo "$(date): efinder-update started"
+
+if [ ! -f "$ZIPFILE" ]; then
+    echo "$(date): no update zip found at $ZIPFILE -- nothing to do"
+    exit 0
+fi
+
+echo "$(date): applying update from $ZIPFILE"
+if unzip -o "$ZIPFILE" -d "$SOLVER_DIR"; then
+    echo "$(date): update applied successfully"
+    rm -f "$ZIPFILE"
+else
+    echo "$(date): unzip failed -- leaving zip in place for retry"
+    exit 1
+fi
+
+echo "$(date): restarting efinder.service"
+systemctl restart efinder.service
+echo "$(date): done"

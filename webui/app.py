@@ -109,7 +109,7 @@ def _dms(deg):
     s = int(round((a - d - m / 60) * 3600))
     if s == 60: s = 0; m += 1
     if m == 60: m = 0; d += 1
-    return f"{sign}{d:02d}°{m:02d}'{s:02d}\""
+    return f"{sign}{d:02d}°{m:02d}'{s:02d}\""  # noqa: Q000
 
 
 # ------------------------------------------------------------------
@@ -388,7 +388,7 @@ def wifi_page():
 @app.route("/wifi/ap", methods=["POST"])
 def wifi_ap():
     try:
-        subprocess.run(["sudo", "/usr/local/bin/ap.sh"], timeout=30, capture_output=True)
+        subprocess.run(["sudo", "/home/efinder/ap.sh"], timeout=30, capture_output=True)
     except Exception:
         pass
     return redirect(url_for("wifi_page"))
@@ -405,7 +405,7 @@ def wifi_station():
         if _wifi_connect_proc and _wifi_connect_proc.poll() is None:
             _wifi_connect_proc.terminate()
         _wifi_connect_proc = subprocess.Popen(
-            ["sudo", "/usr/local/bin/station.sh", ssid, password],
+            ["sudo", "/home/efinder/station.sh", ssid, password],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
