@@ -1,23 +1,13 @@
 """
-Maintenance Unix socket protocol.
+Maintenance socket protocol for eFinder tetra3rs_mp.
 
 Wire format: one JSON object per line, both directions.
 
-Request from client:
-  {"cmd": "status", "args": {}}
+Request:  {"cmd": "status", "args": {}}
+Response (ok):   {"ok": true,  "result": {...}}
+Response (fail): {"ok": false, "error": "..."}
 
-Response from server (success):
-  {"ok": true, "result": {...arbitrary JSON...}}
-
-Response from server (failure):
-  {"ok": false, "error": "human-readable explanation"}
-
-Commands and their args/results are documented in the command
-dispatch table in lx200_process._handle_maint_command.
-
-The socket lives at /run/efinder/maint.sock, owned by efinder:efinder
-with mode 0660. Add yourself to the efinder group to use the web UI
-without sudo.
+Socket: /run/efinder/maint.sock
 """
 
 import dataclasses
@@ -40,19 +30,22 @@ class MaintRequest:
     @classmethod
     def decode(cls, line: bytes) -> "MaintRequest":
         obj = json.loads(line.decode("utf-8"))
-        return cls(cmd=str(obj.get("cmd", "")), args=dict(obj.get("args") or {}))
+        return cls(cmd=obj.get("cmd", ""), args=obj.get("args", {}))
 
 
 @dataclasses.dataclass
 class MaintResponse:
     ok: bool
-    result: Any = None
-    error: str = ""
+    result: Optional[Any] = None
+    error: Optional[str] = None
 
     def encode(self) -> bytes:
+        d: dict = {"ok": self.ok}
         if self.ok:
-            return (json.dumps({"ok": True, "result": self.result}) + "\n").encode("utf-8")
-        return (json.dumps({"ok": False, "error": self.error}) + "\n").encode("utf-8")
+            d["result"] = self.result or {}
+        else:
+            d["error"] = self.error or "unknown error"
+        return (json.dumps(d) + "\n").encode("utf-8")
 
     @classmethod
     def decode(cls, line: bytes) -> "MaintResponse":
@@ -60,38 +53,28 @@ class MaintResponse:
         return cls(
             ok=bool(obj.get("ok", False)),
             result=obj.get("result"),
-            error=str(obj.get("error", "")),
+            error=obj.get("error"),
         )
 
 
-def call(cmd: str, args: Optional[dict] = None,
-         socket_path: Optional[str] = None,
-         timeout: float = 10.0) -> MaintResponse:
-    """Synchronous client helper: send one request, read one response.
-
-    socket_path defaults to the module-level SOCKET_PATH (which respects
-    the EFINDER_MAINT_SOCKET environment variable at import time).
-    """
-    if socket_path is None:
-        socket_path = SOCKET_PATH
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    s.connect(socket_path)
+def call(cmd: str, args: Optional[dict] = None, timeout: float = 5.0) -> MaintResponse:
+    """Send a single request to the maintenance socket and return the response."""
+    if args is None:
+        args = {}
+    req = MaintRequest(cmd=cmd, args=args)
     try:
-        s.sendall(MaintRequest(cmd=cmd, args=args or {}).encode())
-        # Read one newline-terminated response
-        buf = b""
-        while b"\n" not in buf:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        line, _, _ = buf.partition(b"\n")
-        if not line:
-            return MaintResponse(ok=False, error="empty response from server")
-        return MaintResponse.decode(line)
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(SOCKET_PATH)
+            sock.sendall(req.encode())
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        return MaintResponse.decode(data.split(b"\n")[0])
+    except FileNotFoundError:
+        return MaintResponse(ok=False, error="efinder not running (socket not found)")
+    except Exception as exc:
+        return MaintResponse(ok=False, error=str(exc))
