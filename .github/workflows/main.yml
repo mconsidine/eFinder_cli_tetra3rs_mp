@@ -261,6 +261,7 @@ jobs:
                 samba-common-bin \\
                 zram-tools \\
                 openssh-server \\
+                avahi-daemon \\
                 initramfs-tools
             dpkg --configure -a || true
           "
@@ -336,8 +337,9 @@ jobs:
           echo "        echo \"\$(date): Update applied successfully.\" >> \"\$LOG\""        | sudo tee -a "$APPLY" > /dev/null
           echo "        rm -f \"\$ZIPFILE\""                                                | sudo tee -a "$APPLY" > /dev/null
           echo "    else"                                                                    | sudo tee -a "$APPLY" > /dev/null
-          echo "    echo \"Update failed --- removing zip.\""                               | sudo tee -a "$APPLY" > /dev/null
-          echo "    rm -f \"\$ZIPFILE\""                                                    | sudo tee -a "$APPLY" > /dev/null
+          echo "        echo \"\$(date): Update failed -- removing zip.\" >> \"\$LOG\""      | sudo tee -a "$APPLY" > /dev/null
+          echo "        rm -f \"\$ZIPFILE\""                                                | sudo tee -a "$APPLY" > /dev/null
+          echo "    fi"                                                                      | sudo tee -a "$APPLY" > /dev/null
           echo "fi"                                                                          | sudo tee -a "$APPLY" > /dev/null
           sudo chmod 755 "$APPLY"
           sudo chown root:root "$APPLY"
