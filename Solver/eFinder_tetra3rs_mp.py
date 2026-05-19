@@ -800,8 +800,9 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
     import socket
 
     nonlocal_state = {
-        'target_ra':  None,
-        'target_dec': None,
+        'target_ra':   None,
+        'target_dec':  None,
+        'client_time': None,   # set by :SL# before :SC# so we can sync clock
     }
 
     def _handle_lx200(conn, addr):
@@ -863,11 +864,25 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
             return ''
 
         # --- Date / Time ---
+        if cmd.startswith('SL'):
+            # :SLHH:MM:SS# — store local time sent by SkySafari before :SC#
+            state['client_time'] = cmd[2:]
+            return '1'
+
         if cmd.startswith('SC'):
-            # :SCmm/dd/yy#
+            # :SCmm/dd/yy# — apply date; pair with stored :SL# time to set clock
             try:
                 parts = cmd[2:].split('/')
-                coordinates.dateSet(int(parts[0]), int(parts[1]), int(parts[2]))
+                mm, dd, yy = int(parts[0]), int(parts[1]), int(parts[2])
+                yyyy = 2000 + yy if yy < 70 else 1900 + yy
+                time_str = (state.get('client_time')
+                            or datetime.now().strftime('%H:%M:%S'))
+                dt_arg = f'{yyyy:04d}-{mm:02d}-{dd:02d} {time_str}'
+                subprocess.Popen(
+                    ['sudo', '/usr/local/bin/efinder-set-time', dt_arg],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                coordinates.dateSet(mm, dd, yyyy)
             except Exception:
                 pass
             return '1Updating        Planetary Data  #                                #'
@@ -922,7 +937,7 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
             return coordinates.dd2aligndms(dec) + '#'
 
         # --- Offset / calibration commands (no-op ok) ---
-        if cmd.startswith('St') or cmd.startswith('Sg') or cmd.startswith('SL'):
+        if cmd.startswith('St') or cmd.startswith('Sg'):
             return '1'
 
         # --- Ignored / unknown ---
