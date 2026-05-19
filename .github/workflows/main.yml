@@ -190,6 +190,13 @@ jobs:
           [ -f scripts/efinder-update ] && sudo install -m 755 scripts/efinder-update \
               $ROOT/usr/local/bin/efinder-update
 
+          [ -f scripts/efinder-set-time ] && sudo install -m 755 scripts/efinder-set-time \
+              $ROOT/usr/local/bin/efinder-set-time
+          sudo mkdir -p $ROOT/etc/sudoers.d
+          printf 'efinder ALL=(root) NOPASSWD: /usr/local/bin/efinder-set-time\n' \
+              | sudo tee $ROOT/etc/sudoers.d/efinder-set-time > /dev/null
+          sudo chmod 440 $ROOT/etc/sudoers.d/efinder-set-time
+
           # Stage firstboot.sh (run on every boot by efinder-firstboot.service)
           sudo install -m 755 scripts/firstboot.sh \
               $ROOT/usr/local/bin/efinder-firstboot.sh
@@ -261,6 +268,7 @@ jobs:
                 samba-common-bin \\
                 zram-tools \\
                 openssh-server \\
+                avahi-daemon \\
                 initramfs-tools
             dpkg --configure -a || true
           "
@@ -336,8 +344,9 @@ jobs:
           echo "        echo \"\$(date): Update applied successfully.\" >> \"\$LOG\""        | sudo tee -a "$APPLY" > /dev/null
           echo "        rm -f \"\$ZIPFILE\""                                                | sudo tee -a "$APPLY" > /dev/null
           echo "    else"                                                                    | sudo tee -a "$APPLY" > /dev/null
-          echo "    echo \"Update failed --- removing zip.\""                               | sudo tee -a "$APPLY" > /dev/null
-          echo "    rm -f \"\$ZIPFILE\""                                                    | sudo tee -a "$APPLY" > /dev/null
+          echo "        echo \"\$(date): Update failed -- removing zip.\" >> \"\$LOG\""      | sudo tee -a "$APPLY" > /dev/null
+          echo "        rm -f \"\$ZIPFILE\""                                                | sudo tee -a "$APPLY" > /dev/null
+          echo "    fi"                                                                      | sudo tee -a "$APPLY" > /dev/null
           echo "fi"                                                                          | sudo tee -a "$APPLY" > /dev/null
           sudo chmod 755 "$APPLY"
           sudo chown root:root "$APPLY"

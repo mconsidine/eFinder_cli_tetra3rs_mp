@@ -45,7 +45,9 @@ import threading
 import subprocess
 import traceback
 from datetime import datetime, timezone
-from multiprocessing import Process, Value, Queue, Event, shared_memory
+from multiprocessing import (
+    Process, Value, Queue, Event, shared_memory, set_start_method,
+)
 from ctypes import c_double, c_bool
 from pathlib import Path
 
@@ -70,6 +72,9 @@ HEALTH_INTERVAL = 30   # seconds between watchdog checks in main()
 # LX200 server constants
 LX200_PORT  = 4060
 MAINT_SOCK  = '/run/efinder/maint.sock'
+
+# Path written by solver for webui camera/focus pages
+LIVE_IMAGE = '/dev/shm/efinder_live.jpg'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -318,10 +323,13 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     Reads frames from shared memory, extracts centroids via tetra3rs,
     solves (seeded or blind), writes RA/Dec to shared Values.
+    Writes a contrast-enhanced JPEG to LIVE_IMAGE after each cycle
+    so the webui camera view and focus page have a current frame.
     """
     _pin_cpu('ef-solver')
 
     import tetra3rs
+    from PIL import Image as _PILImage
 
     param = load_param()
     _sigma_threshold = float(param.get('sigma_threshold', '10.0'))
@@ -329,7 +337,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
     # Load star database
     db_path = BASE_DIR / 'tetra3_index_1.6_0.4.bin'
-    print(f'[solver] loading star database {db_path} …', flush=True)
+    print(f'[solver] loading star database {db_path} ...', flush=True)
     db = tetra3rs.SolverDatabase.load_from_file(str(db_path))
     print(f'[solver] database loaded: {db.num_stars} stars, {db.num_patterns} patterns',
           flush=True)
@@ -381,6 +389,20 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
         except Exception:
             pass
 
+    def _write_live_jpg(img: np.ndarray):
+        """Write a contrast-stretched JPEG to /dev/shm for the webui."""
+        try:
+            lo, hi = np.percentile(img, (0.5, 99.5))
+            if hi > lo:
+                stretched = np.clip((img.astype(np.float32) - lo)
+                                    / (hi - lo) * 255, 0, 255).astype(np.uint8)
+            else:
+                stretched = img
+            pil_img = _PILImage.fromarray(stretched, mode='L').convert('RGB')
+            pil_img.save(LIVE_IMAGE, format='JPEG', quality=75)
+        except Exception:
+            pass
+
     while True:
         # ------------------------------------------------------------------
         # 1. Wait for a new frame
@@ -390,6 +412,9 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
 
         slot = slot_index.value
         img  = bufs[slot].copy()
+
+        # Write live JPEG for webui regardless of solve outcome
+        _write_live_jpg(img)
 
         # ------------------------------------------------------------------
         # 2. Service maintenance commands (non-blocking)
@@ -450,7 +475,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             t0 = time.monotonic()
 
             # Quick probe: is there anything useful in the frame?
-            _probe_img = img[::4, ::4]   # 8× decimated thumbnail
+            _probe_img = img[::4, ::4]   # 8x decimated thumbnail
             _probe_cents = tetra3rs.extract_centroids(
                 _probe_img, sigma_threshold=3.0, max_centroids=5,
                 min_area=1, max_area=200)
@@ -551,7 +576,7 @@ def solver_process(shm_names, frame_ready, cam_cmd_q, cam_result_q,
             f'{coordinates.dd2aligndms(dec_j2000)}  '
             f'JNow {coordinates.hh2dms(ra_jnow / 15)} '
             f'{coordinates.dd2aligndms(dec_jnow)}  '
-            f'FOV={_fov_measured:.2f}°  N={len(centroids)}',
+            f'FOV={_fov_measured:.2f}deg  N={len(centroids)}',
             flush=True,
         )
 
@@ -640,13 +665,83 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
         if action == 'ping':
             return {'ok': True, 'pong': True}
 
-        if action == 'get_status':
+        if action == 'version':
+            return {'ok': True, 'result': {'version': 'tetra3rs_mp'}}
+
+        if action in ('get_status', 'status'):
             cmd_q.put({'action': 'get_status'})
             try:
                 r = result_q.get(timeout=5)
+                # Also merge latest solve state from file for webui dashboard
+                try:
+                    with open(STATE_FILE) as f:
+                        file_state = json.load(f)
+                except Exception:
+                    file_state = {}
+                solved = file_state.get('status') == 'ok' and 'ra_deg' in file_state
+                solution = None
+                if solved:
+                    solution = {
+                        'solved':   True,
+                        'ra_deg':   file_state['ra_deg'],
+                        'dec_deg':  file_state['dec_deg'],
+                        'fov_deg':  file_state.get('fov', r.get('fov', 0.0)),
+                        'stars':    file_state.get('n_centroids', 0),
+                        'matches':  file_state.get('n_centroids', 0),
+                        'peak':     200,
+                        'solve_ms': file_state.get('solve_ms', 0.0),
+                        'roll_deg': 0.0,
+                    }
+                return {
+                    'ok': True,
+                    'result': {
+                        'solution': solution,
+                        'boresight': {'x': FRAME_W / 2, 'y': FRAME_H / 2},
+                        'fov_deg':  r.get('fov', 0.0),
+                        'solve_count': r.get('solve_count', 0),
+                        'imu': None,
+                    },
+                }
+            except Exception:
+                return {'ok': False, 'error': 'timeout'}
+
+        if action == 'calibration_status':
+            return {'ok': True, 'result': {
+                'converged': False, 'n': 0, 'fov_deg': 0.0,
+            }}
+
+        if action == 'calibration_reset':
+            return {'ok': True}
+
+        if action in ('exposure_get', 'exposure_set', 'gain_set'):
+            param = load_param()
+            if action == 'exposure_get':
+                return {'ok': True, 'result': {
+                    'exposure_s': float(param.get('exposure', 4.0)),
+                    'gain':       float(param.get('gain', 16.0)),
+                }}
+            exp_s = float(msg.get('exposure_s', param.get('exposure', 4.0)))
+            gain  = float(msg.get('gain',       param.get('gain',     16.0)))
+            if action == 'gain_set':
+                gain = float(msg.get('gain', gain))
+                exp_s = float(param.get('exposure', exp_s))
+            cmd_q.put({'action': 'set_exp', 'exp_s': exp_s, 'gain': gain})
+            if msg.get('persist', False):
+                param['exposure'] = str(exp_s)
+                param['gain']     = str(gain)
+                save_param(param)
+            try:
+                r = result_q.get(timeout=15)
                 return {'ok': True, 'result': r}
             except Exception:
                 return {'ok': False, 'error': 'timeout'}
+
+        if action == 'reset_offset':
+            return {'ok': True}
+
+        if action in ('polar_status', 'polar_start', 'polar_cancel',
+                      'polar_set_latitude'):
+            return {'ok': False, 'error': 'polar alignment not implemented in tetra3rs_mp'}
 
         if action == 'set_exp':
             cmd_q.put({'action': 'set_exp',
@@ -692,7 +787,8 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
 
         if action == 'set_date':
             a = msg.get('args', [])
-            coordinates.dateSet(*a); return '1'
+            coordinates.dateSet(*a)
+            return {'ok': True}
 
         return {'ok': False, 'error': f'unknown action: {action}'}
 
@@ -704,8 +800,9 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
     import socket
 
     nonlocal_state = {
-        'target_ra':  None,
-        'target_dec': None,
+        'target_ra':   None,
+        'target_dec':  None,
+        'client_time': None,   # set by :SL# before :SC# so we can sync clock
     }
 
     def _handle_lx200(conn, addr):
@@ -737,7 +834,6 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
         # --- RA / Dec queries (hot path) ---
         if cmd == 'GR':
             ra  = shared_ra.value
-            ra_hours = ra / 15.0
             raPacket  = coordinates.hh2dms(ra / 15) + '#'
             return raPacket
 
@@ -768,11 +864,25 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
             return ''
 
         # --- Date / Time ---
+        if cmd.startswith('SL'):
+            # :SLHH:MM:SS# — store local time sent by SkySafari before :SC#
+            state['client_time'] = cmd[2:]
+            return '1'
+
         if cmd.startswith('SC'):
-            # :SCmm/dd/yy#
+            # :SCmm/dd/yy# — apply date; pair with stored :SL# time to set clock
             try:
                 parts = cmd[2:].split('/')
-                coordinates.dateSet(int(parts[0]), int(parts[1]), int(parts[2]))
+                mm, dd, yy = int(parts[0]), int(parts[1]), int(parts[2])
+                yyyy = 2000 + yy if yy < 70 else 1900 + yy
+                time_str = (state.get('client_time')
+                            or datetime.now().strftime('%H:%M:%S'))
+                dt_arg = f'{yyyy:04d}-{mm:02d}-{dd:02d} {time_str}'
+                subprocess.Popen(
+                    ['sudo', '/usr/local/bin/efinder-set-time', dt_arg],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                coordinates.dateSet(mm, dd, yyyy)
             except Exception:
                 pass
             return '1Updating        Planetary Data  #                                #'
@@ -827,7 +937,7 @@ def lx200_process(shared_ra, shared_dec, offset_flag, cmd_q, result_q):
             return coordinates.dd2aligndms(dec) + '#'
 
         # --- Offset / calibration commands (no-op ok) ---
-        if cmd.startswith('St') or cmd.startswith('Sg') or cmd.startswith('SL'):
+        if cmd.startswith('St') or cmd.startswith('Sg'):
             return '1'
 
         # --- Ignored / unknown ---
@@ -912,7 +1022,7 @@ def main():
             p = procs.get(spec['name'])
             if p is None or not p.is_alive():
                 exit_code = p.exitcode if p else 'None'
-                print(f'[main] {spec["name"]} died (exit={exit_code}), restarting …',
+                print(f'[main] {spec["name"]} died (exit={exit_code}), restarting ...',
                       flush=True)
                 if p:
                     p.close()
