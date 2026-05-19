@@ -142,7 +142,7 @@ jobs:
           # -----------------------------------------------------------------------
           CONFIG_TXT=$ROOT/boot/firmware/config.txt
           CMDLINE_TXT=$ROOT/boot/firmware/cmdline.txt
-          for setting in "camera_auto_detect=1" "enable_uart=1"; do
+          for setting in "camera_auto_detect=1" "enable_uart=1" "dtoverlay=imx477"; do
             sudo grep -qF "$setting" "$CONFIG_TXT" || \
                 echo "$setting" | sudo tee -a "$CONFIG_TXT" > /dev/null
           done
